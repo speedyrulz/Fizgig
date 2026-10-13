@@ -119,6 +119,13 @@ class DDP:
         t = torch.tensor([float(x)], dtype=torch.float64, device=self.device)
         return float(self._reduce(t, self.dist.ReduceOp.SUM).item()) / self.world
 
+    @torch.no_grad()
+    def average_(self, t):
+        """Average one tensor across the processes, in place (a fused fine-tune step's gradient)."""
+        self._reduce(t, self.dist.ReduceOp.SUM)
+        t.div_(self.world)
+        return t
+
     def minimum(self, x):
         t = torch.tensor([float(x)], dtype=torch.float64, device=self.device)
         return float(self._reduce(t, self.dist.ReduceOp.MIN).item())

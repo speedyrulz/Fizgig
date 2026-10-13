@@ -38,16 +38,18 @@ OPTIONS = (
         ("Both GPUs - split the model (less VRAM per card)", "--multi_gpu=split")),
         choice_notes=(
             ("Both GPUs - full model on each (faster)",
-             "Each GPU loads the whole model and trains half of every epoch's images; their LoRA updates are "
-             "averaged every step. Close to twice as fast. Each card needs the VRAM a one-GPU run needs (Auto "
-             "plans for the smaller card). The per-image loss watch is off in this mode."),
+             "Each GPU loads the whole model and trains half of every epoch's images; their updates are averaged "
+             "every step. Close to twice as fast for a LoRA. Each card needs the VRAM a one-GPU run needs (Auto "
+             "plans for the smaller card), and the per-image loss watch is off. A fine-tune also keeps a copy of "
+             "the weights in system RAM per GPU and shares far more data each step: worth it on Linux, usually not "
+             "on Windows - split suits a fine-tune there."),
             ("Both GPUs - split the model (less VRAM per card)",
-             "One model, its 28 blocks shared between the two cards: each holds about half the weights, so a "
-             "precision that needs Block Swap on one card trains without it. About the speed of one card that "
-             "fits; Block Swap and Compile Blocks are off in this mode.")),
-        hint="Train on two GPUs at once (LoRA, LoKR and slider runs; a fine-tune uses one). Needs two CUDA GPUs; "
+             "One model, its 28 blocks shared between the two cards: each holds about half the weights. A LoRA "
+             "trains without Block Swap; a fine-tune trains bigger windows without streaming blocks from the CPU. "
+             "Block Swap and Compile Blocks are off in this mode.")),
+        hint="Train on two GPUs at once (LoRA, LoKR, slider or fine-tune). Needs two CUDA GPUs; "
              "CUDA_VISIBLE_DEVICES picks which two.",
-        mode="lora", summary="multi-GPU"),
+        summary="multi-GPU"),
 )
 
 

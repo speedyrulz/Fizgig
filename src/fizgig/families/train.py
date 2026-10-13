@@ -573,6 +573,14 @@ class _CheckpointPreviews:
                 pass
 
 
+def _no_skip_fused(ftr):
+    """A data-parallel fine-tune with free-each-gradient averages every gradient inside the backward: a process that
+    skips a step's backward would leave the others waiting for it forever."""
+    if ftr is not None and ftr.fused is not None:
+        raise RuntimeError("[multi-gpu] a step was skipped on one GPU, which a data-parallel fine-tune with "
+                           "free-each-gradient cannot do - untick free-each-gradient, or train on one GPU")
+
+
 def _largest_bucket_mp(group):
     """Megapixels of the run's largest actual bucket (what sets activation memory), or None."""
     try:
@@ -586,15 +594,25 @@ class _FineTune:
     whole-rotation length and cadence, a fresh optimizer per window, and the full-checkpoint save."""
 
     def __init__(self, driver, desc, dit, net, dit_path, device, *, max_train_epochs, rotations, save_every_rotations,
-                 rotate_every, start_window, epochs_done, fused, lr, master_dir, mp=None, group=None, max_parts=0):
+                 rotate_every, start_window, epochs_done, fused, lr, master_dir, mp=None, group=None, max_parts=0,
+                 ddp=None, split_devs=None):
         from fizgig.families import ft
         from fizgig.utils.device import plannable_free_vram
         self.ft, self.driver, self.desc, self.dit, self.src, self.lr = ft, driver, desc, dit, dit_path, lr
         self.be = driver.ft_backend(dit, device, dit_path, group) or ft.SharedBackend(driver, dit, device, dit_path,
                                                                                          group)
         where = os.environ.get("FIZGIG_FT_MASTER", "auto")
-        self.scratch = os.path.join(master_dir, ".fizgig_ft_master")
-        gb, where = self.be.build_master(where, self.scratch)
+        # data parallel: every process keeps its own master (identical - they take the same averaged steps), in its
+        # own scratch folder if it spills to disk
+        self.scratch = os.path.join(master_dir, ".fizgig_ft_master" + (f"_gpu{ddp.rank}" if ddp and ddp.rank else ""))
+        if ddp is not None:
+            # one process at a time, so each "auto" choice sees the system RAM the masters before it took
+            for _r in range(ddp.world):
+                if ddp.rank == _r:
+                    gb, where = self.be.build_master(where, self.scratch)
+                ddp.barrier()
+        else:
+            gb, where = self.be.build_master(where, self.scratch)
         n_always = self.be.start_always()
         logger.info(f"[finetune] bf16 master: {len(list(self.be.master.keys()))} weights, {gb:.1f} GB "
                     + ("in system RAM" if where == "ram" else f"ON DISK (system memory can't comfortably hold it; "
@@ -610,10 +628,17 @@ class _FineTune:
             except Exception:
                 pass
         n_blocks = self.be.cycle_len()
+        free = plannable_free_vram()
+        if ddp is not None:                # every process the same windows: the plan for the smallest card
+            free = ddp.minimum(free)
+        elif split_devs is not None:       # the windows span both cards' blocks: their room together
+            from fizgig.families import multigpu
+            free = sum(multigpu.free_gb(d) for d in split_devs) - 1.0
         logger.info(f"[finetune] planning with {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated, "
-                    f"{plannable_free_vram():.2f} GB free")
+                    f"{free:.2f} GB free" + (" across both GPUs" if split_devs is not None else ""))
+        # a split model doesn't stream blocks: the second card holds what streaming would have parked on the CPU
         windows, stream, why, usable = self.be.plan(
-            plannable_free_vram(), allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1", mp=mp,
+            free, allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1" and split_devs is None, mp=mp,
             max_parts=max_parts)
         for line in why:
             logger.info(f"[finetune] {line}")
@@ -628,7 +653,7 @@ class _FineTune:
         self.epochs_done = int(epochs_done)
         self.streamer = getattr(self.be, "streamer", None) or (True if stream else None)
         driver.ft_cycle(self.cycle, self.epochs_done, self.epochs)
-        self.fused = ft.FusedSteps(lr) if fused else None
+        self.fused = ft.FusedSteps(lr, reduce=ddp.average_ if ddp is not None else None) if fused else None
         self.opt_label = ("per-parameter " if fused else "") + ft.make_optimizer([torch.zeros(1)], lr)[1] + " (fine-tune)"
         logger.info(f"[finetune] FULL FINE-TUNE - {self.sched.describe()}")
         logger.info(f"[finetune] {rotations} rotation(s) of {self.cycle} epoch(s) = {self.epochs} epochs; checkpoint"
@@ -753,8 +778,6 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             raise RuntimeError(f"--multi_gpu must be one of {', '.join(multigpu.MODES)}, not {multi_gpu!r}")
         if mg not in desc.multi_gpu:
             raise RuntimeError(f"{desc.display_name} does not offer multi-GPU training ({mg}) yet")
-        if finetune:
-            raise RuntimeError("[multi-gpu] a full fine-tune trains on one GPU - set Multi-GPU to Off for it")
         if mg == "ddp" and not multigpu.in_worker():
             logger.warning("[multi-gpu] data parallel runs from the command line (families/train.py starts a process "
                            "per GPU); called in-process, this run trains on one GPU")
@@ -1077,7 +1100,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                         save_every_rotations=ft_save_every_rotations, rotate_every=ft_rotate_every,
                         start_window=ft_start_window, epochs_done=ft_epochs_done, fused=ft_fused_backward,
                         lr=learning_rate, master_dir=output_dir, mp=_largest_bucket_mp(group), group=group,
-                        max_parts=ft_max_parts)
+                        max_parts=ft_max_parts, ddp=ddp, split_devs=split_devs)
         max_train_epochs, save_every_n_epochs = ftr.epochs, ftr.save_every
         if ftr.streamer is not None:
             swapped = 1          # blocks stream: previews and caption re-encodes must not park + restore the whole DiT
@@ -1461,6 +1484,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 global_step += 1
                 progress.update(1)
                 if ddp is not None:            # the other GPUs still meet this process at the update
+                    _no_skip_fused(ftr)
                     pending += 1
                     if pending >= accum:
                         _update()
@@ -1471,6 +1495,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 global_step += 1
                 progress.update(1)
                 if ddp is not None:
+                    _no_skip_fused(ftr)
                     pending += 1
                     if pending >= accum:
                         _update()
@@ -1556,8 +1581,10 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             watch.boundary(epoch + 1, dit, device, parkable=not swapped)
         if ddp is not None:
             ddp.barrier()
-            # a guard against drift: every process takes the first one's adapter (and average) once an epoch
-            ddp.broadcast_parameters(list(params) + (list(ema.shadow) if ema is not None else []))
+            if ftr is None:
+                # a guard against drift: every process takes the first one's adapter (and average) once an epoch. Not
+                # a fine-tune's window (gigabytes): its processes take the same averaged steps from the same file
+                ddp.broadcast_parameters(list(params) + (list(ema.shadow) if ema is not None else []))
 
         done = epoch + 1
         cadence = bool(save_every_n_epochs) and done % save_every_n_epochs == 0 and done < max_train_epochs
@@ -1565,21 +1592,28 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             # a fine-tune saves and previews at whole rotations only, and the preview renders the checkpoint just
             # saved: the window goes back to NF4 (the master holds every trained weight) and its optimizer is
             # dropped first, which is also what frees the VRAM the render needs
-            if os.path.exists(pause_flag) and done < max_train_epochs and not ftr.rotation_done(done):
+            pause_now = os.path.exists(pause_flag)
+            if ddp is not None:
+                pause_now = ddp.decide(pause_now)      # the first process's look, so every process stops together
+            if pause_now and done < max_train_epochs and not ftr.rotation_done(done):
                 ftr.note_pause(done)
-            if cadence or (os.path.exists(pause_flag) and done < max_train_epochs and ftr.rotation_done(done)):
+            if cadence or (pause_now and done < max_train_epochs and ftr.rotation_done(done)):
                 optimizer = params = None
-                ftr.park()
+                ftr.park()                         # every process: each master takes the window back
                 n_ep = done + ftr.epochs_done
-                save_lora(os.path.join(output_dir, f"{output_name}-{n_ep:06d}.safetensors"), done)
+                if is_main:
+                    save_lora(os.path.join(output_dir, f"{output_name}-{n_ep:06d}.safetensors"), done)
                 if cadence and sample_every_n_epochs:
                     _tp = time.time()
                     previews(n_ep)
                     progress.start_t += time.time() - _tp
-                if os.path.exists(pause_flag):
+                if pause_now or (ddp is None and os.path.exists(pause_flag)):
                     logger.info(f"[pause] requested - rotation complete at epoch {n_ep}, checkpoint saved; exiting "
                                 f"cleanly (continue from {output_name}-{n_ep:06d}.safetensors)")
                     progress.close()
+                    if ddp is not None:
+                        ddp.barrier()
+                        ddp.close()
                     sys.exit(0)
             continue
         if cadence and is_main:
@@ -1619,11 +1653,15 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     if ftr is not None:
         optimizer = params = None
         ftr.park()
-        save_lora(final, max_train_epochs)
-        ftr.be.cleanup()                  # the final checkpoint holds everything the scratch did
+        if is_main:
+            save_lora(final, max_train_epochs)
+        ftr.be.cleanup()                  # the final checkpoint holds everything the scratch did (each its own)
         if sample_every_n_epochs:
             previews(max_train_epochs + ftr.epochs_done)
         logger.info(f"Fine-tune complete -> {final}")
+        if ddp is not None:
+            ddp.barrier()
+            ddp.close()
         return final
     if is_main:
         save_lora(final, max_train_epochs)
@@ -1761,12 +1799,6 @@ def setup_parser():
     return p
 
 
-def finetune_or_worker(a):
-    """No new processes for a run that is already one of them, or that train_family refuses (a fine-tune)."""
-    from fizgig.families import multigpu
-    return multigpu.in_worker() or a.finetune
-
-
 def main():
     if (sys.platform != "win32" and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
             and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1"):
@@ -1775,8 +1807,8 @@ def main():
     os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
     logging.basicConfig(level=logging.INFO)
     a = setup_parser().parse_args()
-    if a.multi_gpu == "ddp" and not finetune_or_worker(a):
-        from fizgig.families import multigpu
+    from fizgig.families import multigpu
+    if a.multi_gpu == "ddp" and not multigpu.in_worker():
         if multigpu.launch_ddp(main):      # a process per GPU, each back in main(); this one only waits
             return
         a.multi_gpu = "off"

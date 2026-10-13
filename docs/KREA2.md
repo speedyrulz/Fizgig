@@ -30,11 +30,11 @@ If a preview can't fit, previews auto-disable and **training keeps running and s
 
 ## Two GPUs
 
-With two NVIDIA GPUs in the machine, **Multi-GPU** (Training tab, Training Parameters) trains one Krea 2 LoRA, LoKR or slider on both:
+With two NVIDIA GPUs in the machine, **Multi-GPU** (Training tab, Training Parameters) trains one Krea 2 LoRA, LoKR, slider or full fine-tune on both:
 
 | Setting | What happens | Use it when |
 |---|---|---|
-| **Off (one GPU)** | The usual single-card run. | One GPU, or a fine-tune (always one GPU). |
+| **Off (one GPU)** | The usual single-card run. | One GPU. |
 | **Both GPUs - full model on each (faster)** | Each card loads the whole model and trains half of every epoch's images. After every step the two LoRA updates are averaged, so both cards hold the same LoRA all run. Close to **twice as fast**. | The model fits each card on its own (with or without Block Swap). |
 | **Both GPUs - split the model (less VRAM per card)** | One copy of the model, its 28 blocks shared between the cards: each holds about half the weights. A precision that needs Block Swap on one card can train without it. | Cards too small for the precision you want: split avoids the slow Block Swap path. It is not faster than a single card that already fits. |
 
@@ -42,6 +42,7 @@ Notes:
 
 - **Full model on each**: Auto plans the precision for the *smaller* of the two cards, so both run the same setup. Each card needs the VRAM a one-GPU run needs. The per-image loss watch (problem images, per-image LR, auto-recaption, look warm-up) is off in this mode, because each card sees only half the images. Previews, checkpoints and saved states come from the first GPU, and the second waits while they are written. Pause and resume work as usual, including resuming a one-GPU run on two.
 - **Split**: Auto plans with both cards' free VRAM together. The first card also holds the text-fusion stack, the input and output layers and the preview VAE, so it gets fewer blocks; the console prints where the split landed. Block Swap and Compile Blocks are off in this mode.
+- **Fine-tuning** works in both modes. *Split* is the one to reach for: the windows of weights a fine-tune trains are shared between the cards, so they can be bigger and frozen blocks no longer stream from system RAM. *Full model on each* halves the steps, but every step the two cards exchange the whole window's gradients (gigabytes, where a LoRA's are megabytes), and each GPU keeps its own copy of the weights in system RAM (or on disk, chosen automatically). That pays off on Linux; on Windows, where the exchange goes through system RAM, it is usually slower than one card. With free-each-gradient on, a skipped step stops the run with a message (Krea 2 never skips steps).
 - Which GPUs: the first two CUDA devices. Set `CUDA_VISIBLE_DEVICES=0,1` (or `2,3`, and so on) before launching to choose.
 - On Linux the cards talk over NCCL. Windows has no NCCL, so the LoRA's gradients are averaged through system RAM (Gloo). That works, but the speed-up is smaller there, most of all at high ranks.
 - Headless: `--multi_gpu ddp` or `--multi_gpu split` on `src/fizgig/families/train.py` (and optionally `--split_at N`, the first block on the second card). See [CLI.md](CLI.md#krea-2-training).

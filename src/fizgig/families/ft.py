@@ -356,6 +356,8 @@ class Rotator:
                     raise RuntimeError(f"[finetune] always-on module {mod_name}.{lname} is quantised - always-on "
                                        f"modules must stay bf16 (outside the family's quant targets)")
                 self.always.append((f"{mod_name}.{lname}.weight" if lname else f"{mod_name}.weight", m))
+        # a model split across two GPUs (families/multigpu.py): each window weight trains on its own block's GPU
+        self._split = getattr(dit, "_fizgig_split", None) is not None
         self.master: Dict[str, torch.Tensor] = {}
         self.loc: Dict[str, tuple] = {}       # model key -> (file key, part, parts)
         self.src = None
@@ -410,7 +412,8 @@ class Rotator:
     def _activate(self, pairs):
         for key, lin in pairs:
             self._forward[id(lin)] = lin.__dict__.pop("forward", None)    # the NF4 forward, restored verbatim
-            lin.weight = nn.Parameter(self.master[key].to(self.device, dtype=torch.bfloat16), requires_grad=True)
+            dev = lin._nf4_packed.device if self._split and lin._nf4_packed is not None else self.device
+            lin.weight = nn.Parameter(self.master[key].to(dev, dtype=torch.bfloat16), requires_grad=True)
             lin._nf4_packed = lin._nf4_state = None     # pure duplication while it trains
         return len(pairs)
 
@@ -632,10 +635,12 @@ def make_optimizer(params, lr):
 
 class FusedSteps:
     """Optimizer in backward: one optimizer per parameter, stepped from its grad hook and the grad freed at once,
-    so only one parameter's gradient is ever live (~5 GB saved on Krea 2). No clipping, no accumulation."""
+    so only one parameter's gradient is ever live (~5 GB saved on Krea 2). No clipping, no accumulation. `reduce`
+    (data-parallel training): called on each gradient before its step, to average it across the GPUs."""
 
-    def __init__(self, lr):
+    def __init__(self, lr, reduce=None):
         self.lr = lr
+        self.reduce = reduce
         self.opts = {}
         self.handles = []
 
@@ -647,6 +652,8 @@ class FusedSteps:
         def _hook(param):
             opt = self.opts.get(param)
             if opt is not None:
+                if self.reduce is not None:
+                    self.reduce(param.grad)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
         for p in params:
