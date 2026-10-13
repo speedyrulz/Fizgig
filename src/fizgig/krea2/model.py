@@ -11,6 +11,8 @@ varlen / cu_seqlens machinery handle text padding. See THIRD_PARTY_NOTICES.md.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import math
 from dataclasses import dataclass
 
@@ -71,6 +73,17 @@ def temb(
     args = (t.float() * tfactor)[:, None, None] * freqs
     sin, cos = torch.sin(args), torch.cos(args)
     return torch.cat((cos, sin), dim=-1).to(dtype=dtype)
+
+
+def _attn_params_to(params: AttentionParams, device) -> AttentionParams:
+    """The shared attention parameters with their tensors on `device` (a split model's second GPU). Copied rather than
+    rebuilt: __post_init__ would re-read the lengths and record the shape a second time."""
+    out = copy.copy(params)
+    for name in ("attention_mask", "seqlens", "cu_seqlens"):
+        v = getattr(out, name, None)
+        if torch.is_tensor(v):
+            setattr(out, name, v.to(device))
+    return out
 
 
 @dataclass
@@ -476,22 +489,36 @@ class SingleStreamDiT(nn.Module):
 
         freqs = self.posemb(pos)
 
+        # Two-GPU split (families/multigpu.py): blocks from `at` on live on the second GPU. The block inputs cross
+        # once, there; the output layer is back on the first GPU with the loss target.
+        split = getattr(self, "_fizgig_split", None)
+        at = split["at"] if split is not None else -1
+        dev_ctx = contextlib.nullcontext()
+
         for index, block in enumerate(self.blocks):
+            if index == at:
+                dev = split["devices"][1]
+                combined, tvec, freqs = combined.to(dev), tvec.to(dev), freqs.to(dev)
+                attn_params = _attn_params_to(attn_params, dev)
+                dev_ctx = torch.cuda.device(dev)      # kernels (Triton's among them) launch on the blocks' GPU
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(index)
 
-            if getattr(block, "_handles_checkpointing", False):
-                # torch.compile wraps blocks in a module that checkpoints itself, so the recompute
-                # is captured inside the compiled graph. Checkpointing again here would nest it.
-                combined = block(combined, tvec, freqs, attn_params)
-            elif self.gradient_checkpointing and self.training:
-                combined = torch.utils.checkpoint.checkpoint(block, combined, tvec, freqs, attn_params, use_reentrant=False)
-            else:
-                combined = block(combined, tvec, freqs, attn_params)
+            with dev_ctx:
+                if getattr(block, "_handles_checkpointing", False):
+                    # torch.compile wraps blocks in a module that checkpoints itself, so the recompute
+                    # is captured inside the compiled graph. Checkpointing again here would nest it.
+                    combined = block(combined, tvec, freqs, attn_params)
+                elif self.gradient_checkpointing and self.training:
+                    combined = torch.utils.checkpoint.checkpoint(block, combined, tvec, freqs, attn_params, use_reentrant=False)
+                else:
+                    combined = block(combined, tvec, freqs, attn_params)
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, index)
 
+        if split is not None:
+            combined = combined.to(t.device)
         final = self.last(combined, t)
         output = final[:, :imglen, :]  # image tokens are the leading slice now
 

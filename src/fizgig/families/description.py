@@ -490,6 +490,10 @@ class FamilyDescription:
     # things a user or a later session must know, with sources
     notes: tuple = ()
     options: tuple = ()               # FamilyOption controls (the family's own settings, as launch tokens)
+    # two-GPU training the trainer offers this family (families/multigpu.py): "ddp" = the whole model on each GPU,
+    # each training its share of the images; "split" = one model divided between two GPUs (needs the driver's
+    # split_blocks). () = one GPU only
+    multi_gpu: tuple = ()
     # a saved preset / Last Train written by the family's old entry: {standard-layer key: old key} filled in when the
     # preset lacks the new key (H3's MINIMAX_EMA -> FAMILY_EMA, its fine-tune card's keys, ...)
     settings_aliases: dict = field(default_factory=dict)

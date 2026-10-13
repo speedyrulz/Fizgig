@@ -363,6 +363,12 @@ Persistent artifacts: exclusions are recorded per model family in `<image_direct
 
 Two warnings worth internalising before you reach for the dropdown. **Learning rates do not transfer between families:** Lion applies the *sign* of the update and wants roughly a tenth of an AdamW LR. Fizgig logs a warning when the LR looks wrong for the family, but it will not override you. And **saving optimizer memory buys you little here** — a LoRA's state is tens of MB against a 13–19 GB base, so the reason to change optimizer is update *behaviour*, not VRAM. If a run fails to construct the optimizer it falls back to plain AdamW and says so in the log; the choice is recorded in the output LoRA as `ss_optimizer`.
 
+**Two GPUs** ([details](KREA2.md#two-gpus))
+
+- `--multi_gpu ddp` — the whole model on each of two GPUs, each training half of every epoch's images, with the LoRA's gradients averaged every optimizer step. Run the command as usual: the trainer starts one process per GPU itself (no `torchrun` needed) and only the first one writes checkpoints, states, previews and the console. The per-image loss watch flags are switched off in this mode. Auto precision plans for the smaller card.
+- `--multi_gpu split` — one model divided between two GPUs (blocks `0 … N-1` plus the input/output layers on the first, the rest on the second), for cards too small for the precision you want. Block swap and compile are off. `--split_at N` sets the first block on the second card; by default it is picked from each card's free VRAM.
+- The GPUs are the first two CUDA devices: `CUDA_VISIBLE_DEVICES` chooses which. A fine-tune (`--finetune`) trains on one GPU and refuses `--multi_gpu`.
+
 **Fine-tuning the base model** — `--finetune` trains the model's own weights a component at a time instead of a LoRA; see [FINETUNE.md](FINETUNE.md). A Context LoRA doesn't combine with it (a fine-tune trains the base itself), so the trainer refuses `--context_lora_path` with `--finetune`. **Sliders** work as on [Qwen Image 2.1](#qwen-image-21-training) (`--slider_pairs`, `--slider_prompts`).
 
 **Not offered (by design):** block targeting (no Krea 2 block map yet) and turning off gradient checkpointing (always on).

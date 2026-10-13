@@ -563,10 +563,12 @@ class FamilyLoRA:
         self._frozen.pop(name, None)
 
     def move_adapter(self, name, device):
-        """Move one frozen adapter's weights (e.g. a speed LoRA parked on CPU between previews)."""
+        """Move one frozen adapter's weights (e.g. a speed LoRA parked on CPU between previews). On a model split
+        across two GPUs, "to the GPU" means beside each adapter's own base weight."""
+        split = getattr(self.dit, "_fizgig_split", None) is not None and torch.device(device).type == "cuda"
         for w in self.wrapped.values():
             if name in w.adapters:
-                w.adapters[name].to(device)
+                w.adapters[name].to(w._base_device() if split and hasattr(w, "_base_device") else device)
 
     # ---- bake: what is live now, as one standard LoRA in the family format ------------------------
     @torch.no_grad()

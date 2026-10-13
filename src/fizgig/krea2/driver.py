@@ -49,6 +49,11 @@ class Krea2Driver(FamilyDriver):
     def compile_targets(self, dit):
         return dit.blocks
 
+    def split_blocks(self, dit):
+        # the 28 main blocks; the text-fusion stack, the input / timestep layers and the output layer stay on the
+        # first GPU (SingleStreamDiT.forward moves the block inputs across and the result back)
+        return dit.blocks
+
     def compile_plan(self, mode, total_steps, precision, blocks_to_swap, mp=0.25):
         """Krea 2's own measured rule (utils/capabilities: should_compile / compile_boundary) - its compiled-memory
         figures place the checkpoint inside the graph where it fits and outside where it does not."""
