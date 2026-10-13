@@ -5,7 +5,7 @@ Facts are the original trainer's (src/fizgig/krea2/trainer.py - removed with the
 """
 from fizgig.families.description import (
     GENERAL_NEGATIVE,
-    FamilyDescription, LoRAFormat, ModelFile, SamplingSettings, SpeedLoRA,
+    FamilyDescription, FamilyOption, LoRAFormat, ModelFile, SamplingSettings, SpeedLoRA,
 )
 
 _COMFY = "Comfy-Org/Krea-2"
@@ -27,6 +27,28 @@ def _preset(rank, lr=1e-4, adaptive=None, epochs=30, slider=False, mp="0.25"):
         # a prompt slider's push strength: 3 on Krea 2 (Peter's slider tests, 1 Oct 2026; Qwen's is 2)
         "FAMILY_SLIDER_GUIDANCE": "3",
     }
+
+
+# Two GPUs (families/multigpu.py). Data parallel is the speed option: each card holds the whole model and trains half
+# of every epoch. Split is the memory option: one model, its blocks shared between the cards
+OPTIONS = (
+    FamilyOption("KREA2_MULTI_GPU", "Multi-GPU", width=44, choices=(
+        ("Off (one GPU)", ""),
+        ("Both GPUs - full model on each (faster)", "--multi_gpu=ddp"),
+        ("Both GPUs - split the model (less VRAM per card)", "--multi_gpu=split")),
+        choice_notes=(
+            ("Both GPUs - full model on each (faster)",
+             "Each GPU loads the whole model and trains half of every epoch's images; their LoRA updates are "
+             "averaged every step. Close to twice as fast. Each card needs the VRAM a one-GPU run needs (Auto "
+             "plans for the smaller card). The per-image loss watch is off in this mode."),
+            ("Both GPUs - split the model (less VRAM per card)",
+             "One model, its 28 blocks shared between the two cards: each holds about half the weights, so a "
+             "precision that needs Block Swap on one card trains without it. About the speed of one card that "
+             "fits; Block Swap and Compile Blocks are off in this mode.")),
+        hint="Train on two GPUs at once (LoRA, LoKR and slider runs; a fine-tune uses one). Needs two CUDA GPUs; "
+             "CUDA_VISIBLE_DEVICES picks which two.",
+        mode="lora", summary="multi-GPU"),
+)
 
 
 KREA2 = FamilyDescription(
@@ -140,6 +162,8 @@ KREA2 = FamilyDescription(
     # Ultra mode (Peter, 1 Oct 2026): blocks 0-7 + the four text-fusion blocks. His Repair Studio surgery on slider LoRAs
     # (detail blocks and the I/O layers off) held up at strength 20 without distortion
     slider_ultra_blocks=tuple(f"block_{i}" for i in range(8)) + ("txt_lw_0", "txt_lw_1", "txt_rf_0", "txt_rf_1"),
+    multi_gpu=("ddp", "split"),
+    options=OPTIONS,
 
     sampling=(
         SamplingSettings("RAW", steps=28, cfg=4.5, sampler="euler", scheduler="simple", negative_prompt=True,

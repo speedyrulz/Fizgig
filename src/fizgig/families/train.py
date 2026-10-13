@@ -717,7 +717,8 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                  finetune=False, ft_rotations=10, ft_save_every_rotations=1, ft_rotate_every=1, ft_max_parts=0,
                  ft_start_window=0,
                  ft_epochs_done=0, ft_fused_backward=False, reg_lr_multiplier=0.2, preview_checkpoint=None,
-                 preview_checkpoint_cache="auto", preview_int8=False, family_options=None):
+                 preview_checkpoint_cache="auto", preview_int8=False, family_options=None, multi_gpu="off",
+                 split_at=None):
     desc = get_family(family)
     if desc is None or not desc.training_ready:
         raise RuntimeError(f"unknown or untrainable family {family!r}")
@@ -742,12 +743,51 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     sample_cfg_scale = desc.preview_cfg if sample_cfg_scale is None else sample_cfg_scale
     sample_width = sample_width or desc.preview_width
     sample_height = sample_height or desc.preview_height
+    # ---- two GPUs (families/multigpu.py): data parallel (a process per GPU, this one of them) or a split model ----
+    from fizgig.families import multigpu
+    mg = str(multi_gpu or "off").lower()
+    ddp = None
+    split_devs = None
+    if mg != "off":
+        if mg not in multigpu.MODES:
+            raise RuntimeError(f"--multi_gpu must be one of {', '.join(multigpu.MODES)}, not {multi_gpu!r}")
+        if mg not in desc.multi_gpu:
+            raise RuntimeError(f"{desc.display_name} does not offer multi-GPU training ({mg}) yet")
+        if finetune:
+            raise RuntimeError("[multi-gpu] a full fine-tune trains on one GPU - set Multi-GPU to Off for it")
+        if mg == "ddp" and not multigpu.in_worker():
+            logger.warning("[multi-gpu] data parallel runs from the command line (families/train.py starts a process "
+                           "per GPU); called in-process, this run trains on one GPU")
+        elif mg == "ddp":
+            ddp = multigpu.DDP()
+        elif multigpu.gpu_count() < 2:
+            logger.warning(f"[multi-gpu] splitting the model needs 2 GPUs, {multigpu.gpu_count()} visible - "
+                           f"training on one GPU")
+        else:
+            split_devs = multigpu.split_devices(2)
+    is_main = ddp is None or ddp.main
+    if ddp is not None:
+        _watch_on = [n for n, on in (("problem-image detection", log_per_image_loss), ("per-image LR", per_image_lr),
+                                     ("auto-recaption", auto_recaption), ("look warm-up", warmup_look_outliers)) if on]
+        if _watch_on:
+            logger.info(f"[multi-gpu] off with data parallel: {', '.join(_watch_on)} (each GPU sees only half the "
+                        f"images, so the per-image loss watch can't judge them)")
+        log_per_image_loss = per_image_lr = auto_recaption = warmup_look_outliers = False
+        if not is_main:             # the first process renders the previews; the others only train
+            sample_prompts, sample_every_n_epochs, sample_at_first = None, 0, False
+    if split_devs is not None:
+        if blocks_to_swap > 0:
+            logger.info("[multi-gpu] block swap off: the split model already shares its blocks between two cards")
+        if str(compile_blocks).lower() not in ("off", "auto"):
+            logger.info("[multi-gpu] Compile Blocks off for a split model")
+        compile_blocks = "off"
+
     lowmem = _small_card_previews()
     if lowmem and max(sample_width, sample_height) > 768:
         sample_width, sample_height = _cap_canvas(sample_width, sample_height)
         logger.info(f"[preview] card under 20 GB: preview canvas capped to {sample_width}x{sample_height} and the "
                     f"DiT parks on CPU for the decode (#123). FIZGIG_PREVIEW_LOWMEM=0 turns this off.")
-    device = torch.device("cuda")
+    device = ddp.device if ddp is not None else (split_devs[0] if split_devs else torch.device("cuda"))
     quant.apply_vram_cap()          # FIZGIG_SIM_VRAM_GB: behave like a smaller card
     torch.manual_seed(seed)
     os.makedirs(output_dir, exist_ok=True)
@@ -840,11 +880,17 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             raise RuntimeError("Fizgig trains one image at a time: set batch_size = 1 in the dataset config. For a "
                                "larger effective batch use --gradient_accumulation_steps (the same averaged "
                                "gradient, at the memory of batch 1).")
-    loader = DataLoader(group, batch_size=1, shuffle=True, num_workers=0,
+    sampler = None
+    if ddp is not None:
+        # each process its own share of every epoch (the bucket order is seeded per epoch, so every process numbers
+        # the batches alike); an odd count repeats one so every process takes the same number of steps
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(group, num_replicas=ddp.world, rank=ddp.rank, shuffle=True, seed=seed)
+    loader = DataLoader(group, batch_size=1, shuffle=sampler is None, sampler=sampler, num_workers=0,
                         collate_fn=(lambda b: b[0]) if slider_prompts else _Collator(shared_epoch, group))
     steps_per_epoch = len(loader)
     logger.info(f"{desc.display_name} training: {group.num_train_items} items, {max_train_epochs} epochs, "
-                f"{steps_per_epoch} steps/epoch")
+                f"{steps_per_epoch} steps/epoch" + (f" on each of {ddp.world} GPUs" if ddp is not None else ""))
     # A fine-tune's regularisation set: a dataset block marked is_reg, trained at a fixed reduced LR so it tethers
     # the model's prior rather than teaching a subject (a full fine-tune has no rank bound on its drift). A LoRA's
     # update is rank-bounded, so there the block is trained as ordinary images, with a warning.
@@ -874,12 +920,28 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             dit_path=dit_path, network_type=network_type, network_dim=network_dim, lokr_factor=lokr_factor,
             optimizer_type=optimizer_type, training_adapter=training_adapter, context_lora_path=context_lora_path,
             ema_decay=0.98 if str(ema_decay).lower().startswith("short") else ema_decay))
-        if own is not None:
+        plan_free = None
+        if ddp is not None:              # every GPU runs the same plan: the one that fits the smallest card
+            plan_free = ddp.minimum(quant.free_vram_gb())
+        elif split_devs is not None:     # one model over both cards: their room together, less the hand-over
+            plan_free = sum(multigpu.free_gb(d) for d in split_devs) - 1.0
+        if own is not None and plan_free is None:
             precision, blocks_to_swap, why = own
         else:
-            precision, blocks_to_swap, why = quant.plan(desc, driver, precision, blocks_to_swap, megapixels=mp)
-            why += f" at {mp:.2f} MP"
+            precision, blocks_to_swap, why = quant.plan(desc, driver, precision, blocks_to_swap, megapixels=mp,
+                                                        **({"free_gb": plan_free} if plan_free is not None else {}))
+            why += f" at {mp:.2f} MP" + (" (both GPUs' free VRAM)" if split_devs else "")
+        if split_devs is not None and blocks_to_swap > 0:
+            # the two cards together still want swapped blocks: a split model doesn't swap
+            if auto_precision and "nf4" in desc.precisions:
+                precision, why = "nf4", why + "; a split model doesn't swap, so the smallest base"
+            else:
+                why += (f"; a split model doesn't swap - if {precision} runs out of memory on the two cards, pick a "
+                        f"smaller precision")
+            blocks_to_swap = 0
         logger.info(f"[precision] Auto plan: {precision}, block swap {blocks_to_swap} ({why}); asked {req}")
+    if split_devs is not None:
+        blocks_to_swap = 0
 
     # ---- torch.compile (Krea 2's rule), decided here on the empty card as the original does - the free VRAM its
     # checks read would be the loaded DiT's leftovers later - and applied last, after every LoRA has patched the
@@ -958,10 +1020,24 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
 
     # ---- model ----------------------------------------------------------------------------------
     logger.info(f"Loading {desc.display_name} DiT ({precision}) from {dit_path}")
-    dit, swapped = quant.load_base(driver, dit_path, device, precision, blocks_to_swap)
+    if split_devs is not None:
+        # loaded and quantised on the CPU side (INT8 kept there), then each part goes to its own card
+        dit = driver.load_dit(dit_path, "cpu")
+        quant.quantize(dit, driver, precision, split_devs[0], store_device="cpu")
+        multigpu.split_model(driver, dit, split_devs, split_at)
+        swapped = 0
+    elif ddp is not None:
+        # one process at a time: each stages the whole bf16 base in system RAM while it quantises
+        for _r in range(ddp.world):
+            if ddp.rank == _r:
+                dit, swapped = quant.load_base(driver, dit_path, device, precision, blocks_to_swap)
+            ddp.barrier()
+    else:
+        dit, swapped = quant.load_base(driver, dit_path, device, precision, blocks_to_swap)
     if gradient_checkpointing:
         driver.enable_gradient_checkpointing(dit, True)
-    net = FamilyLoRA(dit, driver, device=device)
+    # a split model's adapters each follow their own base weight (and so their own GPU)
+    net = FamilyLoRA(dit, driver, device=None if split_devs is not None else device)
     driver.prepare_training(dit, group, net)
     if training_adapter:
         n = net.add_file(training_adapter, ADAPTER, training_adapter_strength)
@@ -1126,10 +1202,12 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 _esd["shadow"] = _sh
             ema.load_state_dict(_esd)
         logger.info(f"[resume] from {resume_state_dir}: continuing at epoch {start_epoch + 1}/{max_train_epochs}")
+    if ddp is not None:                  # every process from the first one's adapter (and its average)
+        ddp.broadcast_parameters(list(params) + (list(ema.shadow) if ema is not None else []))
     from fizgig.families.loss_watch import Watch
     watch = Watch(output_dir, group, user_config, driver, log=log_per_image_loss, per_image_lr=per_image_lr,
                   auto_recaption=auto_recaption, warmup_look=warmup_look_outliers,
-                  resume=bool(resume_state_dir), start_epoch=start_epoch, te_path=te_path,
+                  resume=bool(resume_state_dir) or not is_main, start_epoch=start_epoch, te_path=te_path,
                   trigger_word=trigger_word, trigger_position=trigger_position,
                   recaption_instruction=recaption_instruction,
                   recaption_instruction_detailed=recaption_instruction_detailed, captioner_path=captioner)
@@ -1152,7 +1230,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             # a resume moves the schedule to where the run paused before the first optimizer step, on purpose;
             # PyTorch's "lr_scheduler.step() before optimizer.step()" warning is for training loops, not this
             warnings.filterwarnings("ignore", message=r"Detected call of `lr_scheduler\.step\(\)` before")
-            for _ in range(start_epoch * updates_per_epoch if accum > 1 else global_step):
+            for _ in range(start_epoch * updates_per_epoch if (accum > 1 or ddp is not None) else global_step):
                 scheduler.step()
 
     last_prompt = [None]
@@ -1217,7 +1295,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                     for k, v in st.items():
                         if torch.is_tensor(v) and v.is_cuda:
                             st[k] = v.to("cpu")
-                            parked.append((st, k))
+                            parked.append((st, k, v.device))
                 if parked:
                     torch.cuda.empty_cache()
                     logger.info(f"[preview] {len(parked)} optimizer tensors parked on CPU for the preview")
@@ -1229,8 +1307,8 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             gc.collect()
             torch.cuda.empty_cache()
         finally:
-            for st, k in parked:            # the next training step needs it back, whatever happened
-                st[k] = st[k].to(device)
+            for st, k, dev in parked:       # the next training step needs it back (on its own GPU), whatever happened
+                st[k] = st[k].to(dev)
 
     def _previews(epoch):
         conds, w, h, sd, prompts = encoded, sample_width, sample_height, sample_seed, sample_prompts
@@ -1288,10 +1366,13 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         previews(ftr.epochs_done if ftr is not None else 0)
 
     # ---- train ----------------------------------------------------------------------------------
-    gen = torch.Generator().manual_seed(seed + start_epoch)
+    gen = torch.Generator().manual_seed(seed + start_epoch + (1000003 * ddp.rank if ddp is not None else 0))
     pause_flag = os.path.join(output_dir, ".pause_requested")
     recorder = LossRecorder()
-    progress = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step, desc="steps", smoothing=0)
+    if ddp is not None and resume_state_dir:
+        global_step = start_epoch * steps_per_epoch      # a state saved by a one-GPU run counts its own steps
+    progress = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step, desc="steps", smoothing=0,
+                    disable=not is_main)
     dit.train()
     pending = 0                            # micro-batches backpropagated since the last optimizer step
     lr_acc = []                            # this window's per-step LR multipliers (driver.step_policy)
@@ -1324,12 +1405,16 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             pending = 0                    # every parameter already stepped from its own gradient hook
             lr_acc.clear()
             return
+        if ddp is not None:
+            ddp.average_gradients(params)
         if max_grad_norm:
             pre = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
             if adaptive is not None and adaptive.clip_signal:
                 adaptive.record_clip(pre, max_grad_norm)
         m = sum(lr_acc) / len(lr_acc) if lr_acc else 1.0
         lr_acc.clear()
+        if ddp is not None:
+            m = ddp.mean(m)                # every process steps at the same rate
         if optimizer.__class__.__name__ == "Automagic3":
             m = 1.0                        # Automagic v3 owns the rate (as on the old H3 trainer)
         if m != 1.0:                       # the window's mean, composed into the LR for this step only (never the loss:
@@ -1345,6 +1430,9 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             scheduler.step()
         if ema is not None:
             ema.update()                   # after the clipped step, so the average tracks what was applied
+        if ddp is not None:
+            # the gradients were shared: a process that skips the whole next window must not send them again
+            optimizer.zero_grad(set_to_none=True)
         pending = 0
 
     # Warm-up reassurance: the first two epochs of a run start slowly (first-sight kernel planning, cuBLAS picks,
@@ -1357,6 +1445,10 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             optimizer = params = None       # let go of the outgoing window before the swap, or both sit in VRAM
             params, optimizer = ftr.enter(epoch)                 # the epoch's window, and a fresh optimizer for it
         torch.cuda.reset_peak_memory_stats()
+        if split_devs is not None:
+            torch.cuda.reset_peak_memory_stats(split_devs[1])
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         t0 = time.time()
         for i, batch in enumerate(loader):
             if epoch - start_epoch < 2 and time.time() - warmup_note[0] > 30.0:
@@ -1368,12 +1460,20 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 recorder.drop(step=i)
                 global_step += 1
                 progress.update(1)
+                if ddp is not None:            # the other GPUs still meet this process at the update
+                    pending += 1
+                    if pending >= accum:
+                        _update()
                 continue
             _skip, _lrm = driver.step_policy(batch, epoch + 1 + (ftr.epochs_done if ftr is not None else 0))
             if _skip:                          # a retired category ("stop"): no forward, no loss, no record
                 recorder.drop(step=i)
                 global_step += 1
                 progress.update(1)
+                if ddp is not None:
+                    pending += 1
+                    if pending >= accum:
+                        _update()
                 continue
             lr_acc.append(_lrm)
             latents = batch["latents"].to(device)
@@ -1441,15 +1541,23 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         if pending:                        # a partial group: settle the optimizer before the epoch-end work
             _update()
         _off = ftr.epochs_done if ftr is not None else 0
-        logger.info(f"epoch {epoch + 1 + _off}/{max_train_epochs + _off}  avr_loss={recorder.moving_average:.4f}  "
+        avr = ddp.mean(recorder.moving_average) if ddp is not None else recorder.moving_average   # all GPUs' images
+        _peak = (multigpu.split_peak_note(split_devs) if split_devs is not None else
+                 f"{torch.cuda.max_memory_reserved() / 1024 ** 3:.1f} GB" + (" per GPU" if ddp is not None else ""))
+        logger.info(f"epoch {epoch + 1 + _off}/{max_train_epochs + _off}  avr_loss={avr:.4f}  "
                     f"step={global_step}  {(time.time() - t0) / max(1, steps_per_epoch):.2f}s/step  "
                     f"lr={learning_rate if optimizer is None else optimizer_lr(optimizer):.3e}  "
                     + (f"({group_rates(optimizer)})  " if optimizer is not None and group_rates(optimizer) else "") +
-                    f"peak VRAM {torch.cuda.max_memory_reserved() / 1024 ** 3:.1f} GB")
+                    f"peak VRAM {_peak}")
         if adaptive:
-            adaptive.epoch_boundary(epoch, recorder.moving_average, net.trainable_modules(), optimizer)
+            adaptive.epoch_boundary(epoch, avr, net.trainable_modules(), optimizer)
         # problem-image verdicts + queued caption fixes / auto-recaptions, re-encoded before the next epoch
-        watch.boundary(epoch + 1, dit, device, parkable=not swapped)
+        if is_main:                        # one process rewrites the caption cache; the others wait for it
+            watch.boundary(epoch + 1, dit, device, parkable=not swapped)
+        if ddp is not None:
+            ddp.barrier()
+            # a guard against drift: every process takes the first one's adapter (and average) once an epoch
+            ddp.broadcast_parameters(list(params) + (list(ema.shadow) if ema is not None else []))
 
         done = epoch + 1
         cadence = bool(save_every_n_epochs) and done % save_every_n_epochs == 0 and done < max_train_epochs
@@ -1474,10 +1582,10 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                     progress.close()
                     sys.exit(0)
             continue
-        if cadence:
+        if cadence and is_main:
             save_lora(os.path.join(output_dir, f"{output_name}-{done:06d}.safetensors"), done)
         state_saved = False
-        if save_state and cadence:
+        if save_state and cadence and is_main:
             state(done)
             prune_state_dirs(output_dir, output_name, keep_last_n_states)
             state_saved = True
@@ -1491,13 +1599,19 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 own = sample_for_epoch(output_dir, output_name, done)
                 if own:
                     refresh_checkpoint_thumbnail(os.path.join(output_dir, f"{output_name}-{done:06d}.safetensors"), own)
-        if os.path.exists(pause_flag) and done < max_train_epochs:
+        pause_now = os.path.exists(pause_flag)
+        if ddp is not None:
+            pause_now = ddp.decide(pause_now)      # the first process's look, so every process stops together
+        if pause_now and done < max_train_epochs:
             if state_saved:
                 logger.info(f"[pause] requested - state for epoch {done} already saved; exiting cleanly")
-            else:
+            elif is_main:
                 logger.info(f"[pause] requested - saving state at epoch {done} and exiting cleanly")
                 state(done)
             progress.close()
+            if ddp is not None:
+                ddp.barrier()
+                ddp.close()
             sys.exit(0)
 
     progress.close()
@@ -1511,14 +1625,18 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             previews(max_train_epochs + ftr.epochs_done)
         logger.info(f"Fine-tune complete -> {final}")
         return final
-    save_lora(final, max_train_epochs)
-    # the last epoch under its number too (#176): a resumed run that extends this one ends on the same plain name, and
-    # without a numbered copy that epoch would be overwritten and lost
-    import shutil
-    shutil.copyfile(final, os.path.join(output_dir, f"{output_name}-{max_train_epochs:06d}.safetensors"))
-    if save_state_on_train_end:
-        state(max_train_epochs)
-    logger.info(f"Training complete -> {final}")
+    if is_main:
+        save_lora(final, max_train_epochs)
+        # the last epoch under its number too (#176): a resumed run that extends this one ends on the same plain
+        # name, and without a numbered copy that epoch would be overwritten and lost
+        import shutil
+        shutil.copyfile(final, os.path.join(output_dir, f"{output_name}-{max_train_epochs:06d}.safetensors"))
+        if save_state_on_train_end:
+            state(max_train_epochs)
+        logger.info(f"Training complete -> {final}")
+    if ddp is not None:
+        ddp.barrier()                      # the others wait for the final save, then all leave together
+        ddp.close()
     return final
 
 
@@ -1623,6 +1741,11 @@ def setup_parser():
                    help="step each weight as its gradient lands and free it (less VRAM; no clipping or accumulation)")
     p.add_argument("--reg_lr_multiplier", type=float, default=0.2,
                    help="fine-tune: LR multiplier for images in a dataset block marked is_reg = true")
+    p.add_argument("--multi_gpu", default="off", choices=("off", "ddp", "split"),
+                   help="two GPUs (families with multi_gpu): ddp = the whole model on each GPU, each training half "
+                        "the images (faster); split = one model divided between the two (less VRAM per card)")
+    p.add_argument("--split_at", type=int, default=None,
+                   help="--multi_gpu split: the first block on the second GPU (default: from each card's free VRAM)")
     p.add_argument("--compile_blocks", default="auto", choices=("auto", "on", "outside", "off"),
                    help="torch.compile the DiT blocks (families with compiles=True); auto weighs warm-up vs run length")
     p.add_argument("--ema_decay", type=lambda v: v if str(v).lower().startswith("short") else float(v), default=0.0,
@@ -1638,6 +1761,12 @@ def setup_parser():
     return p
 
 
+def finetune_or_worker(a):
+    """No new processes for a run that is already one of them, or that train_family refuses (a fine-tune)."""
+    from fizgig.families import multigpu
+    return multigpu.in_worker() or a.finetune
+
+
 def main():
     if (sys.platform != "win32" and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
             and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1"):
@@ -1646,6 +1775,11 @@ def main():
     os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
     logging.basicConfig(level=logging.INFO)
     a = setup_parser().parse_args()
+    if a.multi_gpu == "ddp" and not finetune_or_worker(a):
+        from fizgig.families import multigpu
+        if multigpu.launch_ddp(main):      # a process per GPU, each back in main(); this one only waits
+            return
+        a.multi_gpu = "off"
     prompts = None
     if a.sample_prompts and os.path.exists(a.sample_prompts):
         with open(a.sample_prompts, encoding="utf-8") as f:
@@ -1688,7 +1822,8 @@ def main():
         ft_fused_backward=a.ft_fused_backward, reg_lr_multiplier=a.reg_lr_multiplier,
         preview_checkpoint=a.preview_checkpoint, preview_checkpoint_cache=a.preview_checkpoint_cache,
         preview_int8=a.preview_int8,
-        family_options=dict(o.split("=", 1) for o in a.family_option if "=" in o))
+        family_options=dict(o.split("=", 1) for o in a.family_option if "=" in o), multi_gpu=a.multi_gpu,
+        split_at=a.split_at)
 
 
 if __name__ == "__main__":

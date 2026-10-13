@@ -72,7 +72,12 @@ def quantize(dit, driver, precision, compute_device, store_device=None):
 
 
 def move(dit, device):
-    """dit.to(device), plus NF4's packed weights (plain attributes .to() does not see)."""
+    """dit.to(device), plus NF4's packed weights (plain attributes .to() does not see). A model split across two GPUs
+    (families/multigpu.py) parks whole on the CPU and goes back to its own split when moved to a GPU."""
+    if getattr(dit, "_fizgig_split", None) is not None and torch.device(device).type == "cuda":
+        from fizgig.families.multigpu import place
+        place(dit)
+        return
     dit.to(device)
     if getattr(dit, "_nf4_quantized", False):
         from fizgig.modules.nf4 import move_nf4_to_device

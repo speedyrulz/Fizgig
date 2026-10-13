@@ -373,6 +373,12 @@ class FamilyDriver:
         """Put the training model back exactly as training had it."""
         raise NotImplementedError
 
+    def split_blocks(self, dit):
+        """The ModuleList of transformer blocks a two-GPU split divides (families/multigpu.py), or None when this
+        family cannot split. The model's forward must move the block inputs to the second GPU at
+        dit._fizgig_split["at"] and bring the result back before its output layer (Krea 2's SingleStreamDiT does)."""
+        return None
+
     def compile_targets(self, dit):
         """The ModuleList of transformer blocks torch.compile replaces in place (descriptions with compiles=True).
         The DiT's forward must call a block that has `_handles_checkpointing` directly, without its own checkpoint."""
