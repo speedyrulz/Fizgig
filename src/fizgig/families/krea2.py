@@ -32,7 +32,7 @@ def _preset(rank, lr=1e-4, adaptive=None, epochs=30, slider=False, mp="0.25"):
 # Two GPUs (families/multigpu.py). Data parallel is the speed option: each card holds the whole model and trains half
 # of every epoch. Split is the memory option: one model, its blocks shared between the cards
 OPTIONS = (
-    FamilyOption("KREA2_MULTI_GPU", "Multi-GPU", section="other", width=44, choices=(
+    FamilyOption("KREA2_MULTI_GPU", "Multi-GPU", width=44, choices=(
         ("Off (one GPU)", ""),
         ("Both GPUs - full model on each (faster)", "--multi_gpu=ddp"),
         ("Both GPUs - split the model (less VRAM per card)", "--multi_gpu=split")),

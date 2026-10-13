@@ -30,7 +30,7 @@ If a preview can't fit, previews auto-disable and **training keeps running and s
 
 ## Two GPUs
 
-With two NVIDIA GPUs in the machine, **Multi-GPU** (Training tab, Other Options) trains one Krea 2 LoRA, LoKR or slider on both:
+With two NVIDIA GPUs in the machine, **Multi-GPU** (Training tab, Training Parameters) trains one Krea 2 LoRA, LoKR or slider on both:
 
 | Setting | What happens | Use it when |
 |---|---|---|
