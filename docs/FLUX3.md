@@ -57,6 +57,14 @@ On an 8 GB card the NF4 model trains in about 6 GB, and steps off the GPU while 
 
 A **full fine-tune** needs a **16 GB** card or bigger, like the other larger models. It peaked at 12.6 GB at 0.25 MP and 14.0 GB at 1 MP, training the whole model at once on a 32 GB card, so a 16 GB card fits it too. See [Full fine-tuning](FINETUNE.md).
 
+## Two GPUs
+
+With two NVIDIA GPUs in the machine, **Multi-GPU** (Training tab, Training Parameters) trains a Flux 3 LoRA, LoKR, slider, edit LoRA or full fine-tune on both, the same two ways as [Krea 2](KREA2.md#two-gpus): **full model on each** (each card trains half of every epoch's images, close to twice as fast) or **split the model** (one copy, its 28 single blocks shared between the cards, for cards too small for the precision you want). Flux 3 particulars:
+
+- Split keeps the fifteen per-mode blocks, the embeddings and the output layer on the first card, so it gets fewer single blocks; the console prints where the split landed. Block Swap and Compile Blocks are off.
+- Previews on the distilled model: a split training model steps off both cards onto the CPU for each round of previews and comes back to its split after (a one-card run streams its blocks instead).
+- Headless: `--multi_gpu ddp` or `--multi_gpu split` (and `--split_at N`) on `src/fizgig/families/train.py`, as for Krea 2. See [CLI.md](CLI.md#flux-3-image-klein-training).
+
 ## Previews
 
 Training previews render on the distilled model: 16 steps, no CFG, quick. Without it they render on the Base model at 50 steps with CFG 3.5 against an empty negative prompt, as BFL's reference does, which is much slower. Studio and LoRA Royale preview on the distilled model and follow the Samples tab's settings.

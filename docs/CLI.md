@@ -334,6 +334,7 @@ python src/fizgig/families/train.py \
 - `--preview_checkpoint FILE` — previews on the distilled model (16 steps, no CFG). Without it they render on the Base at 50 steps with `--sample_cfg_scale 3.5` against an empty negative, as BFL's reference does.
 - **Edit LoRAs**, **slider LoRAs**, **fine-tuning**, `--context_lora_path` and the per-image loss watch work as for [Qwen Image 2.1](#qwen-image-21-training); fine-tuning starts at 5e-5 in the GUI. `--sample_reference FILE` makes every preview an edit of that photo.
 - `--train_blocks` and Model Area presets aren't offered yet: Flux 3's block map isn't charted.
+- **Two GPUs**: `--multi_gpu ddp` (the whole model on each card, half the images each) or `--multi_gpu split` (one model, its 28 single blocks divided between the cards; `--split_at N` picks the first block on the second card) work as for [Krea 2](#krea-2-training), fine-tunes included. Split keeps the per-mode blocks and the I/O layers on the first card.
 
 The saved LoRA loads in ComfyUI's standard LoRA loader.
 

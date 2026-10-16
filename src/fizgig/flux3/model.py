@@ -10,6 +10,8 @@ Fizgig additions: gradient checkpointing around each block, and a loader that ac
 import math
 from dataclasses import dataclass
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -283,12 +285,24 @@ class Flux3DiT(nn.Module):
         freqs_sm = rope_embed(torch.cat(id_chunks)[None])
         mods = tuple(torch.cat(c) for c in mods)
         blocks = list(self.single_blocks) if self.blocks_to_swap else None
+        # Two-GPU split (families/multigpu.py): the single blocks from `at` on live on the second GPU. The stream
+        # crosses once, there (bounds are plain ints); the output layer is back on the first with the loss target.
+        split = getattr(self, "_fizgig_split", None)
+        at = split["at"] if split is not None else -1
+        dev_ctx = contextlib.nullcontext()
         for index, block in enumerate(self.single_blocks):
+            if index == at:
+                dev = split["devices"][1]
+                h, freqs_sm, mods = h.to(dev), freqs_sm.to(dev), tuple(m.to(dev) for m in mods)
+                dev_ctx = torch.cuda.device(dev)       # kernels (Triton's among them) launch on the blocks' GPU
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(index)
-            h = self._run(block, h, freqs_sm, bounds, mods)
+            with dev_ctx:
+                h = self._run(block, h, freqs_sm, bounds, mods)
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(blocks, index)
+        if split is not None:
+            h = h.to(x["image"].device)
 
         image = torch.empty_like(x["image"])
         for m, a, b, start in placement:

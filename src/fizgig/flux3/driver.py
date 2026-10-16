@@ -53,6 +53,11 @@ class Flux3Driver(FamilyDriver):
         """The 28 single blocks (most of the compute; the 15 per-mode blocks see only their own tokens)."""
         return dit.single_blocks
 
+    def split_blocks(self, dit):
+        # the 28 single blocks; the per-mode blocks, the embeddings and the output layer stay on the first GPU
+        # (Flux3DiT.forward moves the merged stream across and the result back)
+        return dit.single_blocks
+
     # ---- full fine-tune (families/ft.py) ---------------------------------------------------------
     def ft_spec(self, dit):
         # the per-mode blocks (image, reference, text) then the single blocks as one cycle; each block's six Linears
@@ -87,11 +92,15 @@ class Flux3Driver(FamilyDriver):
         cannot stream: left as it is (token None), or on a card that can't hold the INT8 distilled's resident part
         and a render beside it, parked on the CPU for the round (token 0; unpark moves it back). Measured on a
         simulated 10 GB card: left resident, the second preview ran out of memory."""
+        from fizgig.families import multigpu, quant
         if getattr(dit, "_nf4_quantized", False):
-            from fizgig.families import quant
             torch.cuda.empty_cache()
             if quant.free_vram_gb() >= 8.0:   # INT8 distilled ~5.5 GB + a 1024 px render and decode
                 return None
+            quant.move(dit, "cpu")
+            torch.cuda.empty_cache()
+            return 0
+        if multigpu.is_split(dit):            # a model over two cards doesn't stream: parked whole, back to its split
             quant.move(dit, "cpu")
             torch.cuda.empty_cache()
             return 0

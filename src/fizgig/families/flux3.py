@@ -4,7 +4,8 @@
 Sources: the model cards (huggingface.co/black-forest-labs/flux-3-image-klein, -base, -comfy) and the reference code
 (github.com/black-forest-labs/flux-3-image-klein, Apache-2.0).
 """
-from fizgig.families.description import FamilyDescription, LoRAFormat, ModelFile, SamplingSettings
+from fizgig.families.description import (FamilyDescription, LoRAFormat, ModelFile, SamplingSettings,
+                                         multi_gpu_option)
 
 _COMFY = "black-forest-labs/flux-3-image-klein-comfy"
 _CARD = "https://huggingface.co/black-forest-labs/flux-3-image-klein"
@@ -106,6 +107,10 @@ FLUX3 = FamilyDescription(
     reference_strength=True,          # the workbench's reference strength + previous-frame latent chain, as Klein's
     edit_note=("Pairs of an original and its edited version, the same crop and shape - about 40 pairs is a good "
                "start (20 at least). Each photo 1 MP or larger; Fizgig resizes them."),
+    # two GPUs (families/multigpu.py): the 28 single blocks split between the cards; the per-mode blocks, the
+    # embeddings and the output layer stay on the first (Flux3DiT.forward crosses once, before the split's block)
+    multi_gpu=("ddp", "split"),
+    options=(multi_gpu_option("FLUX3", "its 28 single blocks"),),
     train_preview_checkpoint=True,    # training previews on the distilled (16 steps, no CFG), as Klein's Distilled
     preview_checkpoint_tick="Use the distilled model for samples (16 steps, no CFG - quick)",
     preview_checkpoint_steps_note="Base samples only - the distilled samples use their own 16 steps",

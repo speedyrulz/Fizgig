@@ -260,6 +260,31 @@ class FamilyOption:
         return [t.replace("{}", text) for t in self.tokens.split()] if text else []
 
 
+def multi_gpu_option(prefix: str, blocks: str) -> FamilyOption:
+    """The Multi-GPU dropdown of a family with multi_gpu=("ddp", "split") (families/multigpu.py), in its Training
+    Parameters. Data parallel is the speed option: each card holds the whole model and trains half of every epoch.
+    Split is the memory option: one model, its blocks shared between the cards. `blocks` names what the split
+    divides ("its 28 blocks")."""
+    return FamilyOption(f"{prefix}_MULTI_GPU", "Multi-GPU", width=44, choices=(
+        ("Off (one GPU)", ""),
+        ("Both GPUs - full model on each (faster)", "--multi_gpu=ddp"),
+        ("Both GPUs - split the model (less VRAM per card)", "--multi_gpu=split")),
+        choice_notes=(
+            ("Both GPUs - full model on each (faster)",
+             "Each GPU loads the whole model and trains half of every epoch's images; their updates are averaged "
+             "every step. Close to twice as fast for a LoRA. Each card needs the VRAM a one-GPU run needs (Auto "
+             "plans for the smaller card), and the per-image loss watch is off. A fine-tune also keeps a copy of "
+             "the weights in system RAM per GPU and shares far more data each step: worth it on Linux, usually not "
+             "on Windows - split suits a fine-tune there."),
+            ("Both GPUs - split the model (less VRAM per card)",
+             f"One model, {blocks} shared between the two cards: each holds about half the weights. A LoRA "
+             "trains without Block Swap; a fine-tune trains bigger windows without streaming blocks from the CPU. "
+             "Block Swap and Compile Blocks are off in this mode.")),
+        hint="Train on two GPUs at once (LoRA, LoKR, slider or fine-tune). Needs two CUDA GPUs; "
+             "CUDA_VISIBLE_DEVICES picks which two.",
+        summary="multi-GPU")
+
+
 @dataclass(frozen=True)
 class FamilyDescription:
     # identity
