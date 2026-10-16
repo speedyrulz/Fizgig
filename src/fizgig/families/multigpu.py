@@ -11,9 +11,10 @@
            card that fits the model - the cards take turns - but much faster than block swap.
 
 DDP needs no launcher: train.py re-runs itself once per GPU (torch.multiprocessing.spawn) and the processes meet over
-NCCL (Linux) or Gloo (Windows, which has no NCCL; the gradients then travel through system RAM). Only the first
-process writes anything - checkpoints, states, previews, logs; the others train quietly. The GPUs used are the
-first N visible ones: CUDA_VISIBLE_DEVICES picks which.
+NCCL (Linux) or shared memory (Windows: its PyTorch builds have no NCCL, and their Gloo has no transport - it fails
+with "makeDeviceForHostname(): unsupported gloo device" - so the gradients travel through named shared memory and a
+barrier the launcher hands each process). Only the first process writes anything - checkpoints, states, previews,
+logs; the others train quietly. The GPUs used are the first N visible ones: CUDA_VISIBLE_DEVICES picks which.
 
 A family offers these in its description (multi_gpu = ("ddp", "split")); "split" also needs the driver's
 split_model."""
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 MODES = ("off", "ddp", "split")
 _ENV_RANK = "FIZGIG_DDP_RANK"
+_SHARED = {}            # in a worker launch_ddp started: its barrier and the run's tag (the shared-memory backend)
 
 
 def _free_port():
@@ -50,9 +52,10 @@ def in_worker():
     return _ENV_RANK in os.environ or "LOCAL_RANK" in os.environ
 
 
-def _worker(rank, world, port, argv, entry):
+def _worker(rank, world, port, argv, entry, barrier=None):
     os.environ.update({_ENV_RANK: str(rank), "RANK": str(rank), "LOCAL_RANK": str(rank),
                        "WORLD_SIZE": str(world), "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(port)})
+    _SHARED.update(barrier=barrier, tag=str(port))
     sys.argv = list(argv)
     entry()
 
@@ -64,11 +67,73 @@ def launch_ddp(entry, world=2):
     if have < world:
         logger.warning(f"[multi-gpu] data parallel needs {world} GPUs, {have} visible - training on one GPU")
         return False
+    import multiprocessing
     import torch.multiprocessing as mp
     port = _free_port()
+    barrier = multiprocessing.get_context("spawn").Barrier(world)     # the shared-memory backend's meeting point
     logger.info(f"[multi-gpu] data parallel: starting {world} training processes (one per GPU)")
-    mp.spawn(_worker, args=(world, port, list(sys.argv), entry), nprocs=world, join=True)
+    mp.spawn(_worker, args=(world, port, list(sys.argv), entry, barrier), nprocs=world, join=True)
     return True
+
+
+class _ShmGroup:
+    """Collectives between the processes of one machine without torch.distributed: each process writes its tensor to
+    its own slot of a named shared-memory segment, all meet at the barrier, each reads every slot (summing them in the
+    same order, so every process gets the same bits) and meets again before the slots are reused. A segment per size,
+    made by the first process the first time that size comes up - every process makes the same calls in the same
+    order, so they agree on the names."""
+
+    def __init__(self, rank, world, barrier, tag):
+        self.rank, self.world, self._barrier, self.tag = rank, world, barrier, tag
+        self._segs = {}
+
+    def wait(self):
+        self._barrier.wait()
+
+    def _slots(self, flat):
+        from multiprocessing import shared_memory
+        n = flat.numel() * flat.element_size()
+        seg = self._segs.get(n)
+        if seg is None:
+            name = f"fizgig_ddp_{self.tag}_{n}"
+            if self.rank == 0:
+                seg = shared_memory.SharedMemory(name=name, create=True, size=n * self.world)
+            self.wait()
+            if self.rank != 0:
+                seg = shared_memory.SharedMemory(name=name)
+            self._segs[n] = seg
+        whole = torch.frombuffer(seg.buf, dtype=torch.uint8, count=n * self.world)
+        return [whole[i * n:(i + 1) * n].view(flat.dtype) for i in range(self.world)]
+
+    def reduce(self, flat, op):
+        """flat: a contiguous 1-D CPU tensor, replaced by the sum (or minimum) over the processes."""
+        slots = self._slots(flat)
+        slots[self.rank].copy_(flat)
+        self.wait()
+        acc = slots[0].clone()
+        for s in slots[1:]:
+            acc = acc + s if op == "sum" else torch.minimum(acc, s)
+        self.wait()
+        flat.copy_(acc)
+
+    def broadcast(self, flat):
+        slots = self._slots(flat)
+        if self.rank == 0:
+            slots[0].copy_(flat)
+        self.wait()
+        if self.rank != 0:
+            flat.copy_(slots[0])
+        self.wait()
+
+    def close(self):
+        for seg in self._segs.values():
+            try:
+                seg.close()
+                if self.rank == 0:
+                    seg.unlink()
+            except Exception:
+                pass
+        self._segs = {}
 
 
 # ---- DDP: inside a worker ------------------------------------------------------------------------------------------
@@ -84,19 +149,29 @@ class DDP:
         self.world = int(os.environ.get("WORLD_SIZE", "1"))
         torch.cuda.set_device(self.local_rank)
         self.device = torch.device("cuda", self.local_rank)
-        # NCCL where it exists; Windows builds of PyTorch have only Gloo, which reduces CPU tensors
-        self.backend = "nccl" if sys.platform != "win32" and dist.is_nccl_available() else "gloo"
-        if sys.platform == "win32":
-            os.environ.setdefault("USE_LIBUV", "0")      # Windows builds' TCPStore has no libuv
-        # previews, checkpoint saves and caption fixes run on the first process while the others wait at a barrier:
-        # the timeout has to outlast the longest of them, not NCCL's 10-minute default
-        kw = {"device_id": self.device} if self.backend == "nccl" else {}
-        try:
-            dist.init_process_group(self.backend, rank=self.rank, world_size=self.world,
-                                    timeout=datetime.timedelta(hours=6), **kw)
-        except TypeError:                                  # older PyTorch: no device_id
-            dist.init_process_group(self.backend, rank=self.rank, world_size=self.world,
-                                    timeout=datetime.timedelta(hours=6))
+        # NCCL where it exists; Windows builds of PyTorch have neither NCCL nor a working Gloo, so the processes
+        # launch_ddp started share memory instead (both reduce CPU tensors, through system RAM)
+        self.shm = None
+        if sys.platform != "win32" and dist.is_nccl_available():
+            self.backend = "nccl"
+        elif sys.platform == "win32" or _SHARED.get("barrier") is not None:
+            if _SHARED.get("barrier") is None:
+                raise RuntimeError("[multi-gpu] data parallel on Windows needs the trainer's own launcher - run "
+                                   "families/train.py --multi_gpu ddp directly, not under torchrun")
+            self.backend = "shared memory"
+            self.shm = _ShmGroup(self.rank, self.world, _SHARED["barrier"], _SHARED["tag"])
+        else:
+            self.backend = "gloo"
+        if self.shm is None:
+            # previews, checkpoint saves and caption fixes run on the first process while the others wait at a
+            # barrier: the timeout has to outlast the longest of them, not NCCL's 10-minute default
+            kw = {"device_id": self.device} if self.backend == "nccl" else {}
+            try:
+                dist.init_process_group(self.backend, rank=self.rank, world_size=self.world,
+                                        timeout=datetime.timedelta(hours=6), **kw)
+            except TypeError:                                  # older PyTorch: no device_id
+                dist.init_process_group(self.backend, rank=self.rank, world_size=self.world,
+                                        timeout=datetime.timedelta(hours=6))
         self.main = self.rank == 0
         if not self.main:
             # one console: the first process speaks for the run; the others only warn
@@ -106,7 +181,11 @@ class DDP:
 
     # --- collectives
     def _reduce(self, t, op):
-        if self.backend == "gloo" and t.is_cuda:
+        if self.shm is not None:
+            c = t.detach().reshape(-1).cpu().contiguous()
+            self.shm.reduce(c, "min" if op == self.dist.ReduceOp.MIN else "sum")
+            t.copy_(c.view_as(t))
+        elif self.backend == "gloo" and t.is_cuda:
             c = t.detach().cpu()
             self.dist.all_reduce(c, op=op)
             t.copy_(c)
@@ -138,7 +217,11 @@ class DDP:
         return bool(t.item() > 0)
 
     def _broadcast(self, t):
-        if self.backend == "gloo" and t.is_cuda:
+        if self.shm is not None:
+            c = t.detach().reshape(-1).cpu().contiguous()
+            self.shm.broadcast(c)
+            t.copy_(c.view_as(t))
+        elif self.backend == "gloo" and t.is_cuda:
             c = t.detach().cpu()
             self.dist.broadcast(c, src=0)
             t.copy_(c)
@@ -146,7 +229,9 @@ class DDP:
             self.dist.broadcast(t, src=0)
 
     def barrier(self):
-        if self.backend == "nccl":
+        if self.shm is not None:
+            self.shm.wait()
+        elif self.backend == "nccl":
             self.dist.barrier(device_ids=[self.local_rank])
         else:
             self.dist.barrier()
@@ -198,6 +283,9 @@ class DDP:
                 p.data.copy_(r)
 
     def close(self):
+        if self.shm is not None:
+            self.shm.close()
+            return
         try:
             if self.dist.is_initialized():
                 self.dist.destroy_process_group()
