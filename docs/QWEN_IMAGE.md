@@ -2,7 +2,7 @@
 
 [← Back to the README](../README.md)
 
-Qwen Image 2.1 trains LoRAs and LoKRs in Fizgig, including edit LoRAs learned from before/after pairs, with turbo previews during training, the per-image loss watch, and all five workbench tools (Repair Studio, LoRA the Explorer, Profiler, Extract, LoRA Royale). Saved LoRAs, LoKRs, Repair Studio saves and Extract outputs load in ComfyUI's standard LoRA loader. It's the first model on Fizgig's driver system.
+Qwen Image 2.1 trains LoRAs and LoKRs in Fizgig, including edit LoRAs learned from before/after pairs, with turbo previews during training, the per-image loss watch, and all four workbench tools (Repair Studio, Profiler, Extract, LoRA Royale). Saved LoRAs, LoKRs, Repair Studio saves and Extract outputs load in ComfyUI's standard LoRA loader. It's the first model on Fizgig's driver system.
 
 ## Getting set up
 
@@ -60,7 +60,7 @@ The text encoder only encodes, and loads in 8-bit below about 20 GB free (about 
 
 Training previews render with the **Turbo LoRA** at strength 1, **8 steps, CFG 1** (both set in Preferences; the download button fetches them). Ticking **Use the Turbo model for samples** on the Samples tab renders them on the Turbo DiT instead, with the model being trained parked beside it. Without the Turbo LoRA they render on the plain model at **25 steps, CFG 3**. The training adapter is off for previews; a Context LoRA stays on.
 
-Repair Studio, LoRA the Explorer and LoRA Royale preview on the Turbo DiT (8 steps, CFG 1) when it's set; without it they follow the Samples tab.
+Repair Studio and LoRA Royale preview on the Turbo DiT (8 steps, CFG 1) when it's set; without it they follow the Samples tab.
 
 ## Edit LoRAs
 
@@ -68,9 +68,9 @@ Qwen Image 2.1 is one model for text-to-image and editing, so a LoRA can learn a
 
 A film grade trained on 40 pairs: the original, the edit, and Fizgig's epoch 9 training preview.
 
-![Before edit](../assets/qwen_edit/1_before_edit.jpg)
-![After edit](../assets/qwen_edit/2_after_edit.jpg)
-![Fizgig's epoch 9 preview](../assets/qwen_edit/3_fizgig_epoch9_preview.png)
+![Before edit](assets/qwen_edit/1_before_edit.jpg)
+![After edit](assets/qwen_edit/2_after_edit.jpg)
+![Fizgig's epoch 9 preview](assets/qwen_edit/3_fizgig_epoch9_preview.png)
 
 **What you need:** about 40 pairs (20 at least; more if your photos vary a lot). Each photo 1 MP or larger, e.g. 1200×800; bigger is fine, Fizgig resizes them. An original and its edited version must have the same crop and shape.
 
@@ -79,6 +79,8 @@ A film grade trained on 40 pairs: the original, the edit, and Fizgig's epoch 9 t
 3. **Edited folder (after editing):** the same photos after your edit, with the same file names as the originals (`IMG_0001.jpg` in both), one edited photo per original. This is the same folder as on the Start tab.
 4. **Captions for the edited photos:** type what the edit is, e.g. "Apply my concert grade.", and press **Write captions**. It saves that text as the caption of every photo in the Edited folder.
 5. **Test photo for previews (optional):** an original photo that is in neither folder. The previews during training show the edit applied to it. Any size: it's fitted to the preview size automatically. Left empty, previews use the first original. Edit previews use your edit instruction as their prompt; the Samples tab's prompts aren't used while Edit LoRA is on.
+
+**Edits that bring in extra pictures.** An edit can also put something from other pictures into the photo: this person into that scene, this product on that table. Under **What the edit uses**, pick **The photo + extra pictures** and set the **Extra pictures folder** that appears as step 2. Name each extra picture after the photo it belongs to: `photo_1.png`, `photo_2.png` … for `photo.png`. They can be any shape, up to 9 per photo; only the original has to match the edited photo's crop. The line under the folder says how many photos it found extras for. The edit instruction then says what to do with them, e.g. "Put the person from the second picture into this scene."
 
 Start refuses to run if an edited photo has no original with the same file name, has no caption, or has a different crop or shape from its original.
 
@@ -108,7 +110,9 @@ Frame each pair the same way. Handheld shots from the same spot are fine; what m
 
 Describe one person in the first line ("a close-up photo of a young woman with short dark hair,") and the dial changes her expression and keeps her the same. Keep it general ("a close-up photo of a person who is") and each practice picture shows a different person, so the dial learns only the change and works on anyone. Words like "sad" can bring more than a face (grey light, rain); if the whole scene changes, try a narrower word such as "unsmiling".
 
-**Previews** are strips of three pictures on one seed, at strength -1, 0 and +1. They use the slider's own prompt (the shared caption, or the "What the picture is" line); the Samples tab sets the seed, size and steps.
+**Steer it while it trains:** pushing one thing tends to drag others along (a "details" slider drifting toward realism, say). While a slider from prompts trains, the Training tab's **Slider prompts** panel has its three lines and the push strength: change them and press **Apply at the next epoch**, and it trains on toward the new ends from where it has got to, with no restart. A new "What the picture is" line renders new practice pictures first. A Pause and Resume keeps the latest, and the saved LoRA records every change and the epoch it came in.
+
+**Previews** are strips of three pictures on one seed, at strength -1, 0 and +1. They use the slider's own prompt (the shared caption, or the "What the picture is" line, the latest one if you change it while it trains); the Samples tab sets the seed, size and steps.
 
 Sliders are always a plain LoRA (a LoKR setting is switched to LoRA for the run), and Adaptive LR, EMA and the per-image loss watch are off for them. A Context LoRA works: the dial is learned on top of it, so use the slider with the same context LoRA at the same strength. In ComfyUI, load the slider like any LoRA and set its strength.
 
