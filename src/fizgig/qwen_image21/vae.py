@@ -1625,9 +1625,53 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         return dec
 
 
+def _convert_comfy_vae_state_dict(sd):
+    """ComfyUI's (Wan-style) VAE keys -> diffusers', e.g. the texture-fix VAE: encoder.downsamples.i.downsamples.j /
+    decoder.upsamples.i.upsamples.j (a resnet, or the block's resample + time_conv), middle.0-2, head.0/2, conv1 /
+    conv2 (top level: quant_conv / post_quant_conv), and 3D kernels with one frame made 2D. A diffusers file passes
+    through unchanged."""
+    import re
+    if not any(k.startswith(("encoder.downsamples.", "decoder.upsamples.")) for k in sd):
+        return sd
+    resnet = {"residual.0": "norm1", "residual.2": "conv1", "residual.3": "norm2", "residual.6": "conv2",
+              "shortcut": "conv_shortcut"}
+
+    def sub(rest):                      # "residual.2.weight" -> "conv1.weight"
+        for a, b in resnet.items():
+            if rest.startswith(a + "."):
+                return b + rest[len(a):]
+        return rest
+
+    out = {}
+    for k, v in sd.items():
+        m = re.match(r"(encoder|decoder)\.(downsamples|upsamples)\.(\d+)\.\2\.(\d+)\.(.+)$", k)
+        if m:
+            side, _, i, j, rest = m.groups()
+            blocks = "down_blocks" if side == "encoder" else "up_blocks"
+            if rest.startswith(("resample.", "time_conv.")):
+                new = f"{side}.{blocks}.{i}.{'downsampler' if side == 'encoder' else 'upsampler'}.{rest}"
+            else:
+                new = f"{side}.{blocks}.{i}.resnets.{j}.{sub(rest)}"
+        elif m := re.match(r"(encoder|decoder)\.middle\.(\d)\.(.+)$", k):
+            side, n, rest = m.groups()
+            new = (f"{side}.mid_block.attentions.0.{rest}" if n == "1" else
+                   f"{side}.mid_block.resnets.{int(n) // 2}.{sub(rest)}")
+        elif m := re.match(r"(encoder|decoder)\.head\.(0|2)\.(.+)$", k):
+            new = f"{m[1]}.{'norm_out' if m[2] == '0' else 'conv_out'}.{m[3]}"
+        elif m := re.match(r"(encoder|decoder)\.conv1\.(.+)$", k):
+            new = f"{m[1]}.conv_in.{m[2]}"
+        elif m := re.match(r"conv(1|2)\.(.+)$", k):
+            new = f"{'quant_conv' if m[1] == '1' else 'post_quant_conv'}.{m[2]}"
+        else:
+            new = k
+        # Comfy keeps the convolutions 3D with a time axis of 1; this model's are 2D (an image VAE): the same kernel
+        out[new] = v[:, :, 0] if v.ndim == 5 and v.shape[2] == 1 else v
+    return out
+
+
 def load_qwen21_vae(path, device="cuda", dtype=torch.bfloat16):
-    """The diffusers-format VAE file (Qwen/Qwen-Image-2.1 vae/diffusion_pytorch_model.safetensors) with the
-    vendored vae_config.json."""
+    """The diffusers-format VAE file (Qwen/Qwen-Image-2.1 vae/diffusion_pytorch_model.safetensors) or a ComfyUI-format
+    one (e.g. the texture-fix VAE, keys converted) with the vendored vae_config.json."""
     import inspect
     import json as _json
     import os as _os
@@ -1638,5 +1682,5 @@ def load_qwen21_vae(path, device="cuda", dtype=torch.bfloat16):
         cfg = _json.load(f)
     params = inspect.signature(AutoencoderKLQwenImage21.__init__).parameters
     vae = AutoencoderKLQwenImage21(**{k: v for k, v in cfg.items() if k in params})
-    vae.load_state_dict(load_file(path))
+    vae.load_state_dict(_convert_comfy_vae_state_dict(load_file(path)))
     return vae.to(device, dtype).eval().requires_grad_(False)
