@@ -102,6 +102,10 @@
             <p>Train LoRAs and fine-tunes: pick a model and your training folder, set the previews,
               then start a run and watch it here.</p>
           </div>
+          <div class="section-card news-card" id="newsCard" style="display:none">
+            <div class="card-title">News</div>
+            <div class="card-content" id="newsBody"></div>
+          </div>
           <div class="section-card accent-card">
             <div class="card-title">Model</div>
             <div class="card-desc">What you're training. The Samples, Training and Preferences tabs follow it (Samples and
@@ -114,8 +118,9 @@
           </div>
           <div class="section-card accent-card">
             <div class="card-title">Training folder</div>
-            <div class="card-desc">The pictures (or clips, or songs) to train on, each with a caption file beside it.
-              Captions and Training read from here.</div>
+            <div class="card-desc">The folder this run trains on: your pictures (or clips, or songs), each with its
+              caption file. Pick one from <b>Your training data</b> below, or press <b>Choose…</b> for a folder
+              anywhere else.</div>
             <div class="card-content">
               <div class="field-row"><span class="field-label">Folder:</span>
                 <input type="text" id="imageFolder" class="w-path" placeholder="/workspace/datasets/my_subject">
@@ -127,7 +132,7 @@
           <div class="section-card" id="datasetsCard">
             <div class="card-title"><span>Your training data</span>
               <button class="btn btn-sm" id="datasetsReload">Reload</button></div>
-            <div class="card-desc" id="datasetsDesc">The folders in your training data folder. Click one to train on it.</div>
+            <div class="card-desc" id="datasetsDesc">A shortcut: the folders in your training data folder. Click one to make it the training folder above.</div>
             <div class="card-content">
               <div class="field-row" id="datasetsSearchRow" style="display:none"><span class="field-label">Search:</span>
                 <input type="text" id="datasetsSearch" class="w-path" placeholder="folder name"></div>
@@ -153,8 +158,6 @@
             <div class="card-title">Upload a training folder</div>
             <div class="card-desc">The folder above is on the machine running Fizgig. If your training data (pictures, clips or
               songs) is on the computer you're using now, upload it here, with the caption .txt files (a .zip works too).</div>
-            <div class="card-desc">On the computer running Fizgig? There's no need to use this: Choose… above picks
-              your folder directly.</div>
             <div class="card-content" id="uploadBody">
               <div class="field-row"><span class="field-label">New folder name:</span>
                 <input type="text" id="uploadName" class="w-combo-lg" placeholder="my_subject"></div>
@@ -248,6 +251,28 @@
                   <input type="text" id="prepPadding" class="w-num" value="20">
                   <span class="field-hint">% around the face</span>
                 </div>
+                <details class="tc-box prep-chars" id="prepChars">
+                  <summary>Anime/furry/drawn characters</summary>
+                  <div class="field-hint">Face close-ups, the Look Filter and likeness scores are made for people's
+                    faces. For anime, furry or drawn characters (fursuits too), pick Anime/furry/drawn for both
+                    choices here. People's sets need nothing changed. More in docs/FACE_BACKENDS.md.</div>
+                  <div class="field-row prep-opts">
+                    <span class="field-label">Face finder:</span><select id="prepDetector" class="w-combo-lg"></select>
+                  </div>
+                  <div class="field-hint" id="prepDetectorHint"></div>
+                  <div class="field-row prep-opts">
+                    <span class="field-label">Look match:</span><select id="prepIdentity" class="w-combo-lg"></select>
+                  </div>
+                  <div class="field-hint" id="prepIdentityHint"></div>
+                  <div id="prepYoloRow">
+                    <div class="field-row prep-opts" id="prepYoloPick">
+                      <span class="field-label">YOLO face model:</span>
+                      <input type="text" id="prepYolo" class="w-path" placeholder="Blank: the built-in choice (below)">
+                    </div>
+                    <div class="field-hint" id="prepYoloHint"></div>
+                  </div>
+                  <div class="field-hint" id="prepFaceMsg"></div>
+                </details>
                 <div class="field-hint" id="prepNoFaces" style="display:none">Face detection isn't installed on the
                   Fizgig computer: run install_fizgig.py there to add it. Resize only still works.</div>
                 <div class="field-hint">Sizing is by target area (megapixels), not longest side: this matches how
@@ -289,7 +314,8 @@
             <div class="card-title">Final step: Look Consistency Filter (faces)</div>
             <div class="card-desc">Run this last, after every other prep stage: it scores the finished training
               folder. Pick three baseline pictures that nail the look you want; every picture's face is scored against
-              all three and averaged (ArcFace similarity), so no one photo's angle, expression or light sets the bar.
+              all three and averaged (face similarity; for anime, furry or drawn characters see "Anime/furry/drawn
+              characters" in step 1), so no one photo's angle, expression or light sets the bar.
               It finds pictures that drifted off-look, the near-misses a loss curve can't see. Click pictures to mark
               them, or let Auto-Suggest flag the outliers, then move the marked ones out in one go (to an
               excluded_by_look subfolder; nothing is deleted). The scores are saved with the dataset, so low scorers
@@ -303,6 +329,7 @@
               <div class="field-hint" id="lookStatus">Each score is the average similarity to your 3 baselines. The
                 same person typically lands at 30–70%, the baselines included (each is scored against the other two
                 as well as itself).</div>
+              <div class="field-hint" id="lookDecision"></div>
               <div id="lookPicker" class="look-grid" style="display:none"></div>
               <div class="field-row" id="lookTools" style="display:none">
                 <button class="btn" id="lookSuggest">Auto-Suggest drift</button>
@@ -463,6 +490,7 @@
                 <div class="lik-run" id="likRun"></div>
                 <canvas id="likChart" height="150"></canvas>
               </div>
+              <div class="preview-mode" id="galleryMode" style="display:none"></div>
               <div class="gallery" id="gallery"></div>
             </div>
           </div>
@@ -476,7 +504,8 @@
           <div class="section-card model-strip">
             <div class="card-content"><div class="field-row"><span class="field-label">Model:</span>
               <select class="w-combo-lg family-pick"></select>
-              <span class="field-hint">The same choice as the Start tab's: change it here or there.</span></div></div>
+              <span class="field-hint">The same choice as the Start tab's: change it here or there.</span></div>
+              <div class="family-status" style="display:none"></div></div>
           </div>
           <div class="section-card">
             <div class="card-title">Presets</div>
@@ -497,6 +526,7 @@
               <div class="run-bar run-bar-lg"><span id="runBar"></span></div>
               <div class="run-tiles" id="runTiles"></div>
               <div id="runLoss"></div>
+              <div class="il-box" id="runImageLoss" style="display:none"></div>
               <div class="field-row">
                 <button class="btn" id="btnCheck" title="Runs Start's checks without starting: lists anything missing or wrong, else the stages a run would go through">Check settings</button>
                 <button class="btn btn-primary" id="btnStart">Start Training</button>
@@ -504,6 +534,7 @@
                 <button class="btn btn-sm" id="btnQueueCancel" style="display:none">Cancel edit</button>
                 <button class="btn btn-warning" id="btnPause">Pause</button>
                 <button class="btn" id="btnSampleNow" style="display:none" title="Make the previews now, after the current training step, without waiting for the epoch to end">Sample now</button>
+                <button class="btn" id="btnImageLoss" style="display:none" title="Each training image's loss by epoch, against the rest of the dataset: which images are still being learned, which are done, and what the loss watch decided about each">Per-image loss</button>
                 <button class="btn" id="btnSaveNow" style="display:none" title="Save the LoRA as it is now, after the current training step (as name-stepNNNNNNN.safetensors)">Save now</button>
                 <button class="btn btn-primary" id="btnResume">Resume</button>
                 <button class="btn btn-danger" id="btnStop">Stop</button>
@@ -605,7 +636,7 @@
                 <div class="field-row"><span class="field-label"></span><span class="field-hint" id="stDmixInfo"></span></div>
               </div>
               <div class="field-row"><span class="field-label">Prompt:</span>
-                <textarea id="stPrompt" rows="2" placeholder="Include the LoRA's trigger word"></textarea></div>
+                <textarea id="stPrompt" rows="2" spellcheck="false" placeholder="Include the LoRA's trigger word"></textarea></div>
               <div id="stAudioRows" style="display:none">
                 <div class="field-row"><span class="field-label"></span>
                   <label class="checkbox-label"><input type="checkbox" id="stPbOn"> Blend in a Prompt B</label>
@@ -613,7 +644,7 @@
                   <label class="checkbox-label" title="The model hears a recording (30 s of it: a piece from the start, middle and end) and makes the song sound like it - the voice, the instruments, the mix. Works with or without a song to start from."><input type="checkbox" id="stSndOn"> Sound like a recording (reference)</label></div>
                 <div id="stPbRows" style="display:none">
                   <div class="field-row"><span class="field-label">Prompt B:</span>
-                    <textarea id="stPromptB" rows="2" placeholder="e.g. jazz trio, upright bass, brushed drums, warm"></textarea></div>
+                    <textarea id="stPromptB" rows="2" spellcheck="false" placeholder="e.g. jazz trio, upright bass, brushed drums, warm"></textarea></div>
                   <div class="field-row"><span class="field-label"></span>
                     <span class="st-inline" title="Every step runs the model with both prompts and mixes the two: 0 = Prompt A alone, 1 = Prompt B alone. Baseline gets the same blend, so Baseline vs Tweaked still shows only the sliders. Keep Prompt A's lyrics: Prompt B changes the style while A's words are sung.">
                       <span class="field-hint">A</span><input type="range" id="stPbBlend" min="0" max="1" step="0.05" value="0.5">
@@ -645,7 +676,9 @@
               </div>
               <div class="field-row"><span class="field-label">Seed:</span><input type="text" id="stSeed" class="w-num" value="42">
                 <button class="btn btn-sm" id="stSeedNew" title="A random seed">↻</button>
-                <span class="field-label" id="stResLabel">Res:</span><select id="stRes" class="w-combo st-small-select"></select>
+                <span class="field-label" id="stResLabel">Length (s):</span><select id="stRes" class="w-combo st-small-select"></select>
+                <span class="st-inline" id="stSizeRow"><span class="field-hint">Width</span><select id="stW" class="w-combo st-small-select"></select>
+                  <span class="field-hint">Height</span><select id="stH" class="w-combo st-small-select"></select></span>
                 <label class="checkbox-label" id="stTurboRow" title="It keeps the unchanged blocks' results in VRAM to replay them: turn it off if VRAM is tight."><input type="checkbox" id="stTurbo" checked> Turbo Preview
                   (late-block changes render almost at once; the same picture as a full render)</label></div>
               <div id="stVideoRows" style="display:none">
@@ -654,17 +687,16 @@
                 <div class="field-row"><span class="field-label">Clip:</span>
                   <span class="st-inline"><select id="stH3Len" class="w-combo st-small-select"></select>
                     <span class="field-hint">W</span><select id="stH3W" class="w-combo st-small-select"></select>
-                    <span class="field-hint">H</span><select id="stH3H" class="w-combo st-small-select"></select>
-                    <span class="field-hint">Render size</span><select id="stH3Scale" class="w-combo st-small-select"></select></span></div>
+                    <span class="field-hint">H</span><select id="stH3H" class="w-combo st-small-select"></select></span></div>
                 <div class="field-row"><span class="field-label"></span>
                   <span class="st-inline"><span class="field-hint">Steps</span><input type="text" id="stH3Steps" value="4" title="Sampling steps for the clip. With Turbo at 1.0, 4 steps is the fast loop; Turbo 0 needs about 20.">
                     <span class="field-hint">Turbo</span><input type="text" id="stH3Turbo" value="1" title="Strength of the built-in Turbo LoRA: 1.0 for the fast loop, 0.75 matches the in-training previews. 0 switches it off - the render is the base plus your LoRAs at the steps set. That is how you edit a Turbo LoRA: load it as the primary and set this to 0.">
                     <label class="checkbox-label"><input type="checkbox" id="stH3Sound" checked> Sound</label>
-                    <label class="checkbox-label" title="Also render the same seed, prompt and photos with no LoRA at all, shown on the left. Rendered once per setup: a slider move doesn't re-render it."><input type="checkbox" id="stH3NoLora"> No-LoRA clip</label>
+                    <label class="checkbox-label" title="The first half of the steps (rounded down: 7 steps gives 3) render at half size, then the clip grows to full size for the rest - a faster render. The layout is worked out at half size, so a seed frames differently with it on. From Fizgig's H3 Speed Boost node (SPEED, Xiao et al. 2026, via LC Speed Boost)."><input type="checkbox" id="stH3Boost" checked> Speed Boost</label>
                     <label class="checkbox-label" title="Put up the pass-2 estimate in the Tweaked pane while the remaining passes run"><input type="checkbox" id="stH3Early" checked> Show early</label></span></div>
               </div>
               <div class="field-row" id="stNegRow"><span class="field-label">Negative:</span>
-                <textarea id="stNeg" rows="2"></textarea></div>
+                <textarea id="stNeg" rows="2" spellcheck="false"></textarea></div>
               <div class="field-row" id="stRefRow"><span class="field-label">Reference:</span>
                 <input type="text" id="stRef" class="w-path" placeholder="optional: a reference picture">
                 <button class="btn" id="stRefPick">Choose…</button><button class="btn" id="stRefClear">Clear</button>
@@ -696,8 +728,11 @@
               <a class="btn btn-sm" id="stReport" target="_blank" rel="noopener">📊 Open full report</a></div>
           </div>
           <div class="section-card">
-            <div class="card-title">Preview</div>
+            <div class="card-title">Preview <button class="btn btn-sm" id="stDockOpen"
+              title="Keeps Baseline and Tweaked in view while you scroll to the sliders: a panel you can move and resize, or pin to the top">⧉ Keep in view</button></div>
             <div class="card-content">
+              <div class="st-dock-home" id="stDockHome" style="display:none">The preview is in the panel kept in view.
+                <button class="btn btn-sm" id="stDockBack">Put it back here</button></div>
               <div class="st-preview" id="stPreview">
                 <figure class="gallery-item st-pane" id="stNolPane" style="display:none"><img id="stNol" alt=""><video id="stNolVid" controls loop muted playsinline preload="auto"
                   style="display:none"></video><audio id="stNolAud" controls style="display:none"></audio>
@@ -707,7 +742,7 @@
                   <figcaption id="stBaseCap">Baseline (LoRA at default 1.0)</figcaption></figure>
                 <figure class="gallery-item st-pane"><div class="st-region" id="stRegion"></div><img id="stTweak" alt=""><video id="stTweakVid" controls loop muted playsinline preload="auto"
                   style="display:none"></video><audio id="stTweakAud" controls style="display:none"></audio>
-                  <figcaption>Tweaked (current sliders)</figcaption></figure>
+                  <figcaption id="stTweakCap">Tweaked (current sliders)</figcaption></figure>
               </div>
               <div class="field-hint" id="stPreviewHint">Click either picture to see both full size (← → switches between them).</div>
               <div class="st-metrics" id="stMetrics" style="display:none" title="Paired numbers for the two renders on screen (same seed and prompt, only the blocks differ - where such measures are honest). Likeness: ArcFace similarity to your reference photo. Grid: the model's patch lattice showing through (rising = overbake). Detail: face texture energy (down = plastic, up = fried). Clipped: blown pixels. Sat: saturation.">
@@ -749,27 +784,44 @@
             </div>
           </div>
           <div class="section-card">
-            <div class="card-title"><span>Blocks</span>
-              <span><button class="btn btn-sm" id="stUndo" title="Undo (Ctrl+Z)">↶ Undo</button>
-                <button class="btn btn-sm" id="stRedo" title="Redo (Ctrl+Y)">↷ Redo</button></span></div>
-            <div class="card-desc">One slider per block of the model. A greyed row is a block the loaded LoRA doesn't train, so moving it changes nothing.</div>
-            <div class="card-content">
-              <div class="field-row st-bulk">
-                <select id="stPreset" class="w-combo preset-select"></select>
-                <button class="btn btn-sm" id="stPresetSave">Save preset…</button>
-                <button class="btn btn-sm" data-bulk="reset">Reset all</button>
-                <button class="btn btn-sm" data-bulk="off">All off</button>
-                <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="alternate" title="The main blocks alternate: block 0 on, 1 off, 2 on and so on (even on, odd off); the rest untouched. Invert for the other half. Strengths are kept.">Alternate</button>
-                <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="detail" title="The detail end of the model (H3: blocks 46-49) all on or all off together. Strengths are kept.">Toggle detail blocks</button>
-                <button class="btn btn-sm" data-bulk="on">All on</button>
-                <button class="btn btn-sm" data-bulk="invert">Invert</button>
-                <span class="st-lucky"><button class="btn btn-sm" data-bulk="lucky">🎲 I'm feeling lucky</button>
-                  <span class="st-lucky-label">Min</span><input type="text" id="stLuckyLo" value="0">
-                  <span class="st-lucky-label">Max</span><input type="text" id="stLuckyHi" value="1.5">
-                  <label class="checkbox-label" id="stLuckyHoldBox" style="display:none" title="A lucky roll gives every block a strength anywhere between Min and Max, evenly (a negative Min allows inverted blocks). Hold keeps this model's structure and tidy-up bands near 1; untick it to roll every block across Min-Max."><input type="checkbox" id="stLuckyHold" checked> Hold structure + tidy-up</label></span>
-                <button class="btn btn-sm st-donor-only" data-bulk="donor_on">Donor: all on</button>
-                <button class="btn btn-sm st-donor-only" data-bulk="donor_off">Donor: all off</button>
+            <div class="st-blocks-head">
+              <div class="st-blocks-main">
+                <div class="card-title"><span>Blocks</span>
+                  <span><button class="btn btn-sm" id="stUndo" title="Undo (Ctrl+Z)">↶ Undo</button>
+                    <button class="btn btn-sm" id="stRedo" title="Redo (Ctrl+Y)">↷ Redo</button></span></div>
+                <div class="card-desc">One slider per block of the model. A greyed row is a block the loaded LoRA doesn't train, so moving it changes nothing.</div>
+                <div class="field-row st-bulk">
+                  <select id="stPreset" class="w-combo preset-select"></select>
+                  <button class="btn btn-sm" id="stPresetSave">Save preset…</button>
+                  <button class="btn btn-sm" data-bulk="reset">Reset all</button>
+                  <button class="btn btn-sm" data-bulk="off">All off</button>
+                  <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="alternate" title="The main blocks alternate: block 0 on, 1 off, 2 on and so on (even on, odd off); the rest untouched. Invert for the other half. Strengths are kept.">Alternate</button>
+                  <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="detail" title="The detail end of the model (H3: blocks 46-49) all on or all off together. Strengths are kept.">Toggle detail blocks</button>
+                  <button class="btn btn-sm" data-bulk="on">All on</button>
+                  <button class="btn btn-sm" data-bulk="invert">Invert</button>
+                  <button class="btn btn-sm st-donor-only" data-bulk="donor_on">Donor: all on</button>
+                  <button class="btn btn-sm st-donor-only" data-bulk="donor_off">Donor: all off</button>
+                </div>
               </div>
+              <div class="st-lucky-pill" id="stLuckyPill">
+                <div class="st-lucky-line"><button class="btn btn-sm" data-bulk="lucky">🎲 I'm feeling lucky</button>
+                  <select id="stLuckyWho" class="w-combo st-small-select st-donor-only" style="display:none"
+                    title="Which LoRA's block strengths a lucky roll changes. Both rolls each one separately."><option>Primary</option><option>Donor</option><option>Both</option></select>
+                  <span class="st-lucky-label">Roll</span><select id="stLuckyCount" class="w-combo st-small-select"
+                    title="How many sliders a roll changes, picked at random from those not locked or frozen (with Both, a block's primary and donor are two). All: every one."><option value="all">All</option></select></div>
+                <div class="st-lucky-line">
+                  <span class="st-lucky-label" title="Each rolled block's slider is set to a strength between these two">Slider strengths from</span><input type="text" id="stLuckyLo" value="0"
+                    title="The lowest slider strength a roll can give (a negative one inverts the block)">
+                  <span class="st-lucky-label">to</span><input type="text" id="stLuckyHi" value="1.5"
+                    title="The highest slider strength a roll can give">
+                  <label class="checkbox-label" id="stLuckyHoldBox" style="display:none" title="A lucky roll gives each block it picks a slider strength anywhere in the range set beside it, evenly. Hold keeps this model's structure and tidy-up bands near 1; untick it to roll every block across the whole range."><input type="checkbox" id="stLuckyHold" checked> Hold structure + tidy-up</label></div>
+                <div class="st-lucky-line">
+                  <button class="btn btn-sm" id="stFreeze" title="Lock every block you've moved from its default, so the next rolls leave them alone (and so do presets and the bulk buttons). Press again after a roll to freeze the newly rolled ones too.">🔒 Freeze tweaked</button>
+                  <button class="btn btn-sm" id="stUnfreeze" style="display:none" title="Unlock the blocks Freeze locked (blocks you locked yourself stay locked)">🔓 Unfreeze</button>
+                  <span class="st-lucky-label" id="stLuckyFree" title="The sliders a roll can change: not frozen, not locked by you, and on for the LoRA being rolled"></span></div>
+              </div>
+            </div>
+            <div class="card-content">
               <div id="stPresetSaveRow"></div>
               <div id="stBlocks"></div>
             </div>
@@ -1076,7 +1128,7 @@
                 crossfade) - fill in Trigger so the no-LoRA column drops it. Every epoch: one column per epoch of the render at the
                 top (render it first); Epochs keeps it readable - blank = all, "every 4", or "4,8,12". Every cell is a fresh render, so 3
                 prompts across 5 epochs is 15 renders: keep the prompt list short the first time.</div>
-              <div class="field-row"><span class="field-label">Prompts:</span><textarea id="ryCPrompts" rows="4"
+              <div class="field-row"><span class="field-label">Prompts:</span><textarea id="ryCPrompts" rows="4" spellcheck="false"
                 placeholder="one per line - each becomes a row"></textarea></div>
               <div class="field-row"><span class="field-label">Columns:</span><select id="ryCMode" class="w-combo">
                 <option>Without / with LoRA</option><option>Every epoch</option></select>
@@ -1192,7 +1244,7 @@
             <div class="card-desc">The left picture is your setup; the right is the same seed without it (rendered once and
               kept while its settings hold). Click a still to see it full size.</div>
             <div class="card-content">
-              <div class="field-row rm-top"><span class="field-label">Prompt:</span><textarea id="rmPrompt" rows="3" class="w-path rm-prompt"></textarea>
+              <div class="field-row rm-top"><span class="field-label">Prompt:</span><textarea id="rmPrompt" rows="3" spellcheck="false" class="w-path rm-prompt"></textarea>
                 <button class="btn btn-sm" id="rmHints" title="Append every active mod's 'concept_type: description' - the Loader node's prompt_hint output">+ mod hints</button></div>
               <div class="field-row"><span class="field-label"></span>
                 <label class="checkbox-label" title="Each active mod is shown to the text encoder as a numbered picture or video, the way the pack's H3 RefMod Text Encode node does, so the prompt can say 'the woman in <Picture 1>'. Costs a decode per mod."><input type="checkbox" id="rmNumbered"> Numbered references (Text Encode node)</label>
@@ -1425,7 +1477,8 @@
           <div class="tab-banner">
             <h1>Pods</h1>
             <p>Train on a rented GPU from here. A pod runs Fizgig in the cloud; open it and it's this same app, on a
-              bigger card, while your own computer stays free. Closing it doesn't stop a run.</p>
+              bigger card, while your own computer stays free. Closing it doesn't stop a run. (Rented GPUs: RunPod and
+              Vast.ai supported, see the bottom of this tab)</p>
           </div>
           <div class="section-card">
             <div class="card-title"><span>Your pods</span><button class="btn btn-sm" id="podsReload">Reload</button></div>
@@ -1479,10 +1532,16 @@
                   <select id="pickVol"></select></label>
               </div>
               <div class="pods-list" id="pickList"></div>
-              <div class="field-hint" id="pickNote"></div>
-              <div class="field-hint">Every Deploy link here is a referral one: it supports Fizgig's development at no
-                extra cost to you. <a href="https://github.com/shootthesound/Fizgig/blob/master/docker/README.md"
-                target="_blank" rel="noopener">The pod guide</a></div>
+              <div class="pick-info" id="pickNote"></div>
+              <div class="pick-links">
+                <span class="pick-pill pick-pill-note">⚡ Every Deploy link is a referral one: it supports Fizgig at no
+                  cost to you</span>
+                <a class="pick-pill" href="https://github.com/shootthesound/Fizgig/blob/master/docker/README.md" target="_blank" rel="noopener">RunPod pod guide</a>
+                <a class="pick-pill pick-pill-vast" href="https://cloud.vast.ai/?ref_id=757773&amp;creator_id=757773&amp;name=Fizgig%20LoRa%20Training%20and%20Fine-tuning" target="_blank" rel="noopener">Fizgig on Vast.ai ↗</a>
+                <a class="pick-pill" href="https://github.com/shootthesound/Fizgig/blob/master/docs/VAST.md" target="_blank" rel="noopener">Vast.ai guide</a>
+              </div>
+              <div class="pick-vast-note">Vast.ai: start Fizgig's template on Vast's site (its link is a referral one
+                too), then paste its address into <b>Add a pod</b> above.</div>
             </div>
           </div>
         </section>
@@ -1536,7 +1595,7 @@
   </div>
 
   <div class="modal-backdrop" id="pickerModal">
-    <div class="modal-window" style="width: 640px;">
+    <div class="modal-window" style="width: 760px; max-width: 96vw;">
       <div class="modal-header"><span id="pickerTitle">Choose</span>
         <button class="btn" data-close="pickerModal">✕</button></div>
       <div class="modal-body">
@@ -1550,6 +1609,13 @@
           <button class="btn btn-primary" id="pickerNewMake">Create</button>
           <button class="btn" id="pickerNewCancel">Cancel</button></div>
         <div class="field-hint" id="pickerNewMsg"></div>
+        <div class="field-row"><input type="text" id="pickerFilter" placeholder="Filter names…" style="flex:1">
+          <span class="field-label">Sort by</span>
+          <select id="pickerSort"><option value="name">Name</option><option value="mtime">Date modified</option>
+            <option value="ctime">Date created</option><option value="size">Size</option><option value="type">Type</option></select>
+          <button class="btn btn-sm" id="pickerDir" title="Reverse the order">↑</button></div>
+        <div class="picker-head"><span data-sort="name">Name</span><span data-sort="mtime">Date modified</span>
+          <span data-sort="size">Size</span></div>
         <div id="pickerList" class="picker-list"></div>
       </div>
       <div class="modal-footer"><span class="field-hint upload-status" id="pickerUpMsg"></span>
@@ -1647,9 +1713,9 @@
     <div class="modal-window" style="width: 380px;">
       <div class="modal-header"><span>Log in</span></div>
       <div class="modal-body">
-        <div class="card-desc">Fizgig's password. On a RunPod pod it's the FIZGIG_PASSWORD (or VNC_PASSWORD) set in the
-          template, or, if none was set, the one printed in the pod's logs. On your own computer it's the one in
-          Preferences &gt; Web UI. No user name is needed.</div>
+        <div class="card-desc">Fizgig's password. On a rented GPU (RunPod or Vast.ai) it's the FIZGIG_PASSWORD (or
+          VNC_PASSWORD) set in the template, or, if none was set, the one printed in its log. On your own computer
+          it's the one in Preferences &gt; Web UI. No user name is needed.</div>
         <div class="field-row"><input type="password" id="loginPassword" class="w-path" autocomplete="current-password">
           <button class="btn btn-primary" id="loginButton">Log in</button></div>
         <label class="checkbox-label login-remember"><input type="checkbox" id="loginRemember" checked> Keep me logged in on this device
@@ -1663,7 +1729,7 @@
   <div class="lightbox" id="lightbox" style="display:none">
     <button class="btn lightbox-close" id="lightboxClose" title="Close (Esc)">✕</button>
     <button class="btn lightbox-step" id="lightboxPrev" title="Previous (←)">‹</button>
-    <figure class="lightbox-figure"><img id="lightboxImg" alt=""><figcaption id="lightboxName"></figcaption>
+    <figure class="lightbox-figure"><div class="lightbox-mode" id="lightboxMode" style="display:none"></div><img id="lightboxImg" alt=""><figcaption id="lightboxName"></figcaption>
       <div class="lightbox-cap" id="lightboxCap" style="display:none">
         <textarea id="lightboxCapText" rows="3" spellcheck="true"></textarea>
         <div class="lightbox-cap-row"><button class="btn btn-primary btn-sm" id="lightboxCapSave"

@@ -148,7 +148,7 @@ def _event(ev):
                           donor=ev.get("donor", ""), status="Loaded.", error="")
                 _S["profile"] = _profile(ev.get("hash", ""))
             else:
-                _S.update(donor=ev.get("donor", ""), status="Donor loaded. Enable it per block to mix it in."
+                _S.update(donor=ev.get("donor", ""), status="Donor loaded, fully on in its blocks: turn a block down or off to use less of it."
                           if ev.get("donor") else "Donor unloaded.")
         elif kind == "early" and _S.get("rendering"):     # H3's Show early: the tweaked pane's unfinished look
             _S.update(early=ev.get("png", ""), early_gen=ev.get("gen", 0),
@@ -253,10 +253,18 @@ def plan(desc, prefs, pref_path, fast=True, samples=None, negative=None):
     fast = fast or follow
     dit, speed, use_ck, ck = paths["dit"], "", False, None
     have = lambda k: bool(k and look(k) and os.path.exists(look(k)))
+    # a workbench that follows its Samples tab renders where training previews do: the preview checkpoint only while
+    # the Samples tab's tick for it is on (every workbench tab plans through here, so they all agree)
+    ck_wanted = not (follow and desc.workbench_checkpoint_follows_tick and samples is not None
+                     and samples.get("checkpoint") is False)
     if fast:
         c = desc.preview_checkpoint()
-        if c is not None and have(c[0].pref_key):
+        if ck_wanted and c is not None and have(c[0].pref_key):
             dit, use_ck, ck = look(c[0].pref_key), True, c[1]
+            from fizgig.families.base_check import checkpoint_takes_speed
+            sp0 = desc.preview_speed()
+            if sp0 is not None and have(sp0.pref_key) and checkpoint_takes_speed(desc, dit):
+                speed = look(sp0.pref_key)          # Kromoss as the preview model: the Turbo LoRA can join it
         else:
             sp = desc.preview_speed()
             if sp is not None and have(sp.pref_key):
@@ -274,7 +282,8 @@ def plan(desc, prefs, pref_path, fast=True, samples=None, negative=None):
         steps = settings["steps"]
     swap = str(prefs.get("inference_blocks_to_swap") or "Auto").strip()
     kw = {"dit_path": dit, "vae_path": paths["vae"], "text_encoder_path": paths["text_encoder"],
-          "speed_lora_path": speed, "use_checkpoint_sampling": use_ck, "device": "cuda",
+          "speed_lora_path": speed, "use_checkpoint_sampling": use_ck, "speed_on_checkpoint": bool(use_ck and speed),
+          "device": "cuda",
           "precision": "int8" if str(prefs.get("inference_int8", "")).strip() in ("1", "True", "true") else "auto",
           "blocks_to_swap": "auto" if swap.lower().startswith("auto") else int(
               "".join(ch for ch in swap.split(" ")[0] if ch.isdigit()) or 0)}
@@ -347,12 +356,13 @@ def render(state, extra=None):
 
 
 def metrics(ref=""):
-    """The desktop's metrics strip for the pair on screen: likeness to a reference photo (ArcFace, the Look Filter's
-    embedder) and repair_studio.metrics' paired numbers - patch grid, face detail, clipping, saturation. CPU only."""
+    """The desktop's metrics strip for the pair on screen: likeness to a reference photo (the Look Filter's face
+    embedder; with Auto look match decided from the reference - ArcFace for a person, DINOv2 for a furry / anime
+    face) and repair_studio.metrics' paired numbers - patch grid, face detail, clipping, saturation. CPU only."""
     import numpy as np
     from PIL import Image
     from fizgig.repair_studio.metrics import PATCH_PITCH, compare
-    from fizgig.web.prep_jobs import _embed, embed_face_box
+    from fizgig.web.prep_jobs import _embed, embed_face_box, session_embedder
     with _lock:
         base_p, tweak_p, fam = _S.get("baseline") or "", _S.get("tweaked") or "", _S.get("family") or ""
     if not (base_p and tweak_p and os.path.isfile(base_p) and os.path.isfile(tweak_p)):
@@ -361,12 +371,15 @@ def metrics(ref=""):
     d = get_family(fam)
     pitch = PATCH_PITCH.get((d.shares_prefs_with or d.key) if d is not None else fam, 16)
     try:
-        b_emb, b_box = embed_face_box(base_p)
-        t_emb, t_box = embed_face_box(tweak_p)
-        ref_emb = _embed(ref) if ref and os.path.isfile(ref) else None
+        has_ref = bool(ref and os.path.isfile(ref))
+        emb, _ = session_embedder([ref] if has_ref else [base_p], log=None)    # one embedder for all three
+        b_emb, b_box = embed_face_box(base_p, emb)
+        t_emb, t_box = embed_face_box(tweak_p, emb)
+        ref_emb = _embed(ref, emb) if has_ref else None
         m = compare(np.array(Image.open(base_p).convert("RGB")), np.array(Image.open(tweak_p).convert("RGB")),
                     pitch, b_box, t_box)
         m["ref_set"], m["ref_face"] = bool(ref), ref_emb is not None
+        m["embedder"], m["like_match"] = emb.label, emb.thresholds["match"]
         m["like_base"] = float(np.dot(ref_emb, b_emb)) if ref_emb is not None and b_emb is not None else None
         m["like_tweak"] = float(np.dot(ref_emb, t_emb)) if ref_emb is not None and t_emb is not None else None
         return {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in m.items()}
@@ -709,7 +722,7 @@ CAT_SHORT = {"style_composition": "Style+Comp", "style_ident_overlap": "Style/ID
 KLEIN_PRESETS = {"✨Reset All": None, "✨Identity Only": ["identity", "style_ident_overlap", "ident_details_overlap"],
                  "✨Style+Composition Only": ["style_composition", "style_ident_overlap"],
                  "✨Details Only": ["details", "ident_details_overlap"]}
-STILLS_SIZES = ["256", "384", "512", "768", "1024"]
+STILLS_SIZES = ["256", "384", "512", "640", "768", "1024", "1280", "1536"]   # the Samples tab's + two quick ones
 
 
 def families():
@@ -774,7 +787,7 @@ def layout(desc, prefs, pref_path, samples=None):
                       "scales": [n for n, _ in vc.scales], "scale_of": dict(vc.scales),
                       "models": [c.label for c in vc.checkpoints],
                       "references": {c.label: c.references for c in vc.checkpoints},
-                      "bases": [n for n, _ in vc.bases],
+                      "bases": [n for n, _ in vc.bases], "speed_boost": bool(vc.speed_boost),
                       "sound": bool(audio_vae and os.path.exists(audio_vae))} if kind == "video" and vc else None,
             "song_lengths": SONG_LENGTHS if kind == "audio" else None,
             "prompt_blend": bool(getattr(desc.load_driver(), "supports_prompt_blend", False)),
@@ -799,10 +812,14 @@ def layout(desc, prefs, pref_path, samples=None):
             # a model that follows its Samples tab: what Studio renders with (the negative only matters above CFG 1)
             "follow_cfg": _num((samples or {}).get("cfg"), 1.0), "follow_steps": str((samples or {}).get("steps") or ""),
             "follow_turbo": (samples or {}).get("turbo_name", "") if (samples or {}).get("turbo_live") else "",
-            # the desktop's note: a preview checkpoint set in Preferences (Qwen's Turbo) renders at its own recipe
+            # a preview checkpoint in use (set in Preferences, its Samples-tab tick on): where Studio renders
             "follow_ck": (f"Previews on the {ck[0].label.split(' (')[0]} - {ck[1].steps} steps, CFG {ck[1].cfg:g}. "
-                          f"Clear it in Preferences to preview with the Samples tab's settings instead.")
-            if ck is not None and have(ck[0].pref_key) else ""}
+                          + (f"Untick \"{desc.preview_checkpoint_tick.split(' (')[0]}\" on the Samples tab to preview on "
+                             "the model you train on." if desc.workbench_checkpoint_follows_tick
+                             else "Clear it in Preferences to preview with the Samples tab's settings instead."))
+            if ck is not None and have(ck[0].pref_key) and not (desc.workbench_checkpoint_follows_tick and
+                                                                 (samples or {}).get("checkpoint", True) is False)
+            else ""}
 
 
 def _model_eq(desc, look):

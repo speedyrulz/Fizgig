@@ -38,7 +38,7 @@ from fizgig.web import queue as webqueue
 from fizgig.web import prep_jobs
 from fizgig.families import refmod
 from fizgig.web import studio
-from fizgig.web.port import PORT_DEFAULT, PORT_WALK, listening, on_pod, saved_port
+from fizgig.web.port import PORT_DEFAULT, PORT_WALK, listening, on_pod, on_runpod, on_vast, saved_port
 from fizgig.web.schema import get_schema
 
 logger = logging.getLogger("fizgig.web")
@@ -99,8 +99,32 @@ _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" e
 
 
 # ---- hardware meters (as the desktop status bar) ---------------------------------------------------------------
+def _rocm_launch() -> bool:
+    """True only on the AMD launcher path. NVIDIA Launch Fizgig.bat must never enter the AMD VRAM reader."""
+    return os.environ.get("FIZGIG_GPU_BACKEND", "").lower() == "rocm"
+
+
+def _amd_gpu_row():
+    """One synthetic GPU row from the ROCm VRAM reader (#188). Never imports torch / HIP."""
+    if not _rocm_launch():
+        return None
+    try:
+        from fizgig.utils.vram_monitor import amd_gpu_name, read_amd_gpu_vram
+        hit = read_amd_gpu_vram()
+        if not hit:
+            return None
+        used_b, total_b = hit
+        if total_b <= 0:
+            return None
+        return {"index": 0, "name": amd_gpu_name() or "AMD GPU",
+                "total_gb": total_b / 2 ** 30, "used_gb": max(0, used_b) / 2 ** 30,
+                "uuid": "", "util": None, "temp": None, "power": None, "power_limit": None}
+    except Exception:
+        return None
+
+
 def list_gpus():
-    """[{index, name, total_gb, used_gb, uuid}] from nvidia-smi (every card, whatever CUDA_VISIBLE_DEVICES says)."""
+    """[{index, name, total_gb, used_gb, uuid}] from nvidia-smi (unchanged). On ROCm launch only, AMD fallback (#188)."""
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,uuid,utilization.gpu,"
                               "temperature.gpu,power.draw,power.limit", "--format=csv,noheader,nounits"],
@@ -117,9 +141,12 @@ def list_gpus():
             util, temp, pw, pl = (more + [""] * 4)[:4]
             rows.append({"index": int(i), "name": n, "total_gb": int(t) / 1024, "used_gb": int(u) / 1024,
                          "uuid": uid, "util": num(util), "temp": num(temp), "power": num(pw), "power_limit": num(pl)})
-        return rows
+        if rows:
+            return rows
     except (OSError, ValueError, subprocess.SubprocessError):
-        return []
+        pass
+    row = _amd_gpu_row()
+    return [row] if row else []
 
 
 def _chosen_gpu(rows, want):
@@ -163,7 +190,17 @@ def _poll_stats_loop():
             r = _chosen_gpu(list_gpus(), want)
             if r:
                 name, vu, vt = r["name"], int(r["used_gb"] * 2 ** 30), int(r["total_gb"] * 2 ** 30)
-                extra = {k: r.get(k) for k in ("util", "temp", "power", "power_limit")}
+                extra = {k: r.get(k) for k in ("util", "temp", "power", "power_limit") if r.get(k) is not None}
+        # ROCm launch only - never typeperf/amd-smi on the NVIDIA path even if nvidia-smi is missing (#188).
+        if not vt and _rocm_launch():
+            try:
+                from fizgig.utils.vram_monitor import amd_gpu_name, read_amd_gpu_vram
+                hit = read_amd_gpu_vram()
+                if hit:
+                    vu, vt = int(hit[0]), int(hit[1])
+                    name = amd_gpu_name() or name
+            except Exception:
+                pass
         ru = rt = 0
         if psutil is not None:
             vm = psutil.virtual_memory()
@@ -240,6 +277,13 @@ def folder_trigger(folder) -> str:
     """The training folder's trigger word (one per folder, shared with the desktop's Captions tab)."""
     m = load_last_used().get("folder_triggers")
     return str((m if isinstance(m, dict) else {}).get(_trigger_key(folder), "") or "")
+
+
+def subject_trigger(folder, ext=".txt") -> str:
+    """A subject folder's trigger word: the one saved for it on the Captions tab, else the word its captions open
+    with (a folder never opened on the Captions tab)."""
+    from fizgig.families import multi_person as mp
+    return folder_trigger(folder).rstrip(",").strip() or (mp.caption_trigger(folder, ext) if folder else "")
 
 
 def set_folder_trigger(folder, word):
@@ -410,8 +454,14 @@ def _studio_samples(desc):
     neg = v.get("SAMPLE_NEGATIVE")
     if neg is None:                     # never saved: the Samples tab's own default, as its box shows it
         neg = desc.preview_negative or ""
+    # the Samples tab's preview-checkpoint tick (MOSS-Image's Use the SFT model for samples): the workbench renders
+    # where training previews do - on the checkpoint while it's ticked, on the training model when it isn't
+    ck = v.get("SAMPLE_CHECKPOINT")
+    if blank(ck):
+        ck = desc.preview_checkpoint_on
+    ck = ck if isinstance(ck, bool) else str(ck).strip().lower() in ("1", "true", "yes", "on")
     return {"steps": str(steps), "cfg": str(cfg), "turbo": str(turbo), "negative": neg,
-            "turbo_live": live, "turbo_name": sp.name if sp is not None else ""}
+            "turbo_live": live, "turbo_name": sp.name if sp is not None else "", "checkpoint": ck}
 
 
 def _gpu_training():
@@ -700,6 +750,94 @@ def _refmod_plan(values, image_folder):
     return None, st, p
 
 
+def _multi_person_notes(vals, image_folder, multi_person=True):
+    """The Subjects card's line under each subject: its trigger word, or (other people keeping their faces) the word
+    it trains as and what it was read as - the subject's own boxes override - or why it can't be made."""
+    from fizgig.families import multi_person as mp
+    ext = str(vals.get("DATASET_CAPTION_EXT") or ".txt").strip() or ".txt"
+    rows = [(str(image_folder or "").strip(), "FAMILY_DOP_TRIGGER", "FAMILY_DOP_CLASS")]
+    if vals.get("FAMILY_MULTICONCEPT"):
+        rows += [(str(vals.get(d) or "").strip(), t, c)
+                 for d, t, c in form.CONCEPT_ROWS[:form.concept_count(vals) - 1]]
+    notes, classes = {}, []
+    dop = bool(vals.get("FAMILY_DOP"))
+    fused_rules = []
+    found = {}                     # the correction boxes' greyed text: the trigger word and class Fizgig read
+    for n, (folder, tkey, ckey) in enumerate(rows, start=1):
+        if not folder:
+            notes[f"_subject{n}_as"] = ("Pick the training folder on the Start tab to see it here." if n == 1 else
+                                        f"Pick subject {n}'s folder above to see it here.")
+            continue
+        trig = str(vals.get(tkey) or "").strip() or subject_trigger(folder, ext)
+        cls = str(vals.get(ckey) or "").strip()
+        auto_trig = subject_trigger(folder, ext)
+        if auto_trig:
+            found[tkey] = auto_trig
+            got, _w = mp.subject(folder, auto_trig, "", ext)
+            if got:
+                found[ckey] = got["phrase"].split()[-1]
+        cap = mp.sample_caption(folder, trig.split(",")[0].strip() if trig else "", ext)
+        lines = [f"Trigger word: {trig}" if trig else "Trigger word: none found in this folder's captions",
+                 f"One of its captions: {cap}" if cap else "One of its captions: none found - caption the folder first"]
+        if not multi_person:
+            if dop and cap and trig:
+                pairs = list(zip([t.strip() for t in trig.split(",") if t.strip()],
+                                 [c.strip() for c in cls.split(",")] * 8))
+                kept = mp.dop_caption(cap, pairs)
+                lines += [f"Trains on: {cap}", f"And keeps as the model made it: {kept}" if kept else
+                          "And keeps as the model made it: nothing - this caption has no trigger word"]
+            elif cap:
+                lines.append(f"Trains on: {cap} (as written)")
+            notes[f"_subject{n}_as"] = "\n".join(lines)
+            continue
+        manual = bool(vals.get("FAMILY_MP_MANUAL"))
+        kind = mp.kind_key(vals.get("FAMILY_SUBJECT_KIND" + ("" if n == 1 else str(n))))
+        s, why = mp.subject_as_written(trig, cls, kind) if manual else mp.subject(folder, trig, cls, ext, kind)
+        if not s:
+            notes[f"_subject{n}_as"] = "\n".join(lines + [f"Can't keep other people's faces with this folder: {why}"])
+            continue
+        if s["phrase"]:
+            classes.append(s["phrase"])
+        fused_rules += s["rules"]
+        lines[0] = (f"Trains as: {s['fused']} - a style or look, its trigger word kept as written. Use {s['fused']} "
+                    "in your prompts; without it, pictures stay as the model made them." if s["kind"] == "style" else
+                    f"Trains as: {s['fused']} - used as your captions write it ({s['phrase']}). Use "
+                    f"{s['fused']} in your prompts." if manual else
+                    f"Trains as: {s['fused']} - Fizgig joins the trigger word to what the subject is "
+                    f"(\"{s['trigger']}, {s['phrase']}\" becomes \"{s['fused']}\"), which keeps the subjects apart. "
+                    f"Your caption files aren't changed. Use {s['fused']} in your prompts.")
+        if manual and cap and not re.search(r"(?<!\w)" + re.escape(s["fused"]) + r"(?!\w)", cap, re.I):
+            lines.append(f"Check your captions: this one never uses {s['fused']} - with Use my captions exactly as "
+                         f"written on, write {s['fused']} into them (see How to caption for this).")
+        if cap:
+            fused = mp.fuse(cap, s["rules"])
+            kept = mp.dop_caption(fused, [(s["fused"], s["phrase"])])
+            who = mp.stranger_example() or "one of 32 example people, described"
+            lines += [f"Trains on: {fused}",
+                      f"And keeps as the model made it: {kept}" if kept else
+                      "And keeps as the model made it: nothing - this caption has no trigger word"]
+            lines.append(f"Plus {mp.PER_SUBJECT} side-by-side pictures of {s['fused']} next to a stranger, e.g.: {who} "
+                         f"on the left, and {s['fused']} on the right, {mp.TAIL}" if s["kind"] == "person" else
+                         f"No side-by-side pictures: {s['fused']} isn't a person"
+                         + (" (Subject {} is: From its captions found {})".format(n, s["phrase"])
+                            if kind == "auto" and s["phrase"] else "") + ".")
+        notes[f"_subject{n}_as"] = "\n".join(lines)
+    notes["__placeholders"] = found
+    if multi_person and fused_rules:          # the previews' prompts, as they will be read
+        prompts = [ln.strip() for ln in str(vals.get("SAMPLE_PROMPT") or "").splitlines() if ln.strip()]
+        read = [mp.fuse(p, fused_rules) for p in prompts]
+        if any(a != b for a, b in zip(prompts, read)):
+            notes["SAMPLE_PROMPT"] = "Previews will use: " + " | ".join(read)
+    same = sorted({c for c in classes if classes.count(c) > 1})
+    if same:                 # two women measured: right at epoch 16 where a woman and a man were at 10
+        plural = lambda w: {"woman": "women", "man": "men", "child": "children", "person": "people"}.get(w, w + "s")
+        words = {2: "Two", 3: "Three", 4: "Four"}
+        kinds_ = " and ".join(f"{words.get(classes.count(c), classes.count(c))} of your subjects are "
+                              f"{plural(c.split()[-1])}" for c in same)      # "Two of your subjects are women"
+        notes["MAX_TRAIN_EPOCHS"] = f"{kinds_}: subjects of the same kind can need about 1.6x the epochs."
+    return notes
+
+
 def _plan(family_key, values, image_folder, resume="", ft_continue=None):
     if family_key == refmod.KEY:
         return _refmod_plan(values, image_folder)
@@ -713,6 +851,12 @@ def _plan(family_key, values, image_folder, resume="", ft_continue=None):
     trig = folder_trigger(image_folder)
     if trig:                                         # the folder's own trigger word (Captions tab)
         values["CAPTION_TRIGGER_WORD"] = trig.rstrip(",").strip()
+    # DOP's word to remove when a folder's box is empty: that folder's own trigger word
+    ext = str(values.get("DATASET_CAPTION_EXT") or ".txt").strip() or ".txt"
+    values["DOP_FOLDER_TRIGGER"] = subject_trigger(image_folder, ext) if image_folder else ""
+    for i, (d, _t, _c) in enumerate(form.CONCEPT_ROWS, start=2):
+        concept = str(values.get(d) or "").strip()
+        values[f"DOP_FOLDER_TRIGGER{i}"] = subject_trigger(concept, ext) if concept else ""
     name = str(values.get("LORA_NAME") or "").strip() or "my_lora"
     out_dir = str(values.get("LORA_OUTPUT_DIR") or "").strip() or default_output_dir()
     values.update(LORA_OUTPUT_DIR=out_dir, DATASET_CONFIG=os.path.join(DATASET_DIR, f"{_safe(name)}_web.toml"))
@@ -734,6 +878,15 @@ def _plan(family_key, values, image_folder, resume="", ft_continue=None):
 
 
 _SIZE_KEYS = ("DATASET_MEGAPIXELS", "CLIP_MEGAPIXELS")
+# the settings a Resume takes from the form as it is now: the Samples tab's, block swap (memory only, the results
+# are the same), the save schedule (when checkpoints are written) and the learning rate (the run trains on at the
+# new one, logged); the rest trains on as it was
+_RESUME_SAMPLE_KEYS = ("SAMPLE_PROMPT", "SAMPLE_SEED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS",
+                       "SAMPLE_CFG_SCALE", "FAMILY_TURBO_STRENGTH", "SAMPLE_CHECKPOINT",   # + previews on the checkpoint
+                       "FAMILY_PREVIEW_LOOK",                                              # + the SFT look tick
+                       "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_LATER", "SAMPLE_UNTIL_EPOCH", "SAMPLE_EVERY_AFTER",
+                       "BLOCKS_SWAP", "SAVE_EVERY_N_EPOCHS", "SAVE_LATER", "SAVE_UNTIL_EPOCH", "SAVE_EVERY_AFTER",
+                       "LEARNING_RATE", "ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX")
 
 
 # a prompt slider's live prompts: the request the web UI writes, and what the trainer took (fizgig.families.train's
@@ -1138,6 +1291,13 @@ def _folder_problem(e, out_dir) -> str:
             f"(Output), or set the default in Preferences > LoRA output.")
 
 
+def _resumed(result):
+    """A resume that started: the queue held for that paused run stops showing as held."""
+    if isinstance(result, dict) and not result.get("error") and not result.get("problems"):
+        webqueue.resumed()
+    return result
+
+
 def _start(family_key, values, image_folder, resume="", ft_continue=None, note=""):
     if studio.holding_gpu():                    # Repair Studio's model leaves the GPU for the run
         append_log("Unloading Repair Studio's model to free the GPU for this run.\n")
@@ -1230,6 +1390,8 @@ def pod_storage():
     except OSError:
         return ["Storage: unavailable", False]
     free, total = u.free / 1024 ** 3, u.total / 1024 ** 3
+    if on_vast() and not on_runpod():  # Vast's container disk: kept through a stop, gone when the instance is destroyed
+        return [f"Storage: {free:.0f} GB free of {total:.0f} GB on /workspace", free < 40]
     if total > 10000:                # a network volume shows the host's whole pool, not its quota
         return ["Storage: /workspace is a network volume. Its size is set in RunPod and isn't visible from in "
                 "here - check usage in the RunPod dashboard.", False]
@@ -1370,7 +1532,7 @@ def _stop():
 UPLOAD_EXTS = (MEDIA - {".gif", ".webm"}) | {".txt", ".caption", ".json", ".zip"}
 UPLOAD_DEFAULT = os.path.join(BASE_DIR, "training_data")     # when Preferences has no input folder set
 UPLOAD_FILES = os.path.join(BASE_DIR, "uploads")              # single files: a context LoRA, a test photo
-UPLOAD_FILE_EXTS = (UPLOAD_EXTS - {".zip"}) | {".safetensors"}
+UPLOAD_FILE_EXTS = (UPLOAD_EXTS - {".zip"}) | {".safetensors", ".onnx"}      # .onnx: a YOLO face model (Image Prep)
 
 
 def uploads_root() -> str:
@@ -1431,6 +1593,23 @@ def _audio_seconds(path):
 _SAMPLE_NAME = re.compile(r"^(?P<run>.+)_e(?P<epoch>\d{6})_(?P<idx>\d{2})_\d+_\d+(?:_s(?P<s>\d{3}))?\.\w+$")
 
 
+def preview_labels(mode) -> dict:
+    """{epoch: the line over that epoch's enlarged previews} from the run's record (rounds) and its family's words
+    (description preview_labels); {} for a family that declares none or a run from before the record."""
+    desc = get_family(mode.get("family", "")) if isinstance(mode, dict) else None
+    words = dict(getattr(desc, "preview_labels", ()) or ())
+    if not words:
+        return {}
+    out = {}
+    for ep, r in (mode.get("rounds") or {}).items():
+        line = words.get("checkpoint" if r.get("checkpoint") else "look" if r.get("look") else "base", "")
+        if r.get("turbo") and words.get("turbo"):
+            line = (words["turbo"] + " " + line).strip()
+        if line:
+            out[str(ep)] = line
+    return out
+
+
 def sample_info(name) -> dict:
     """What a preview's name says: its run, epoch, prompt number and strength (None = full)."""
     m = _SAMPLE_NAME.match(name)
@@ -1448,6 +1627,45 @@ def run_prompts(out_dir, name) -> list:
             text = str((r.get("values") or {}).get("SAMPLE_PROMPT") or "")
             return [ln.strip() for ln in text.splitlines() if ln.strip()]
     return []
+
+
+def epoch_prompts(sample_dir, name) -> dict:
+    """The prompts each epoch's previews used, as the trainer recorded them ({"4": [prompt, ...]}); {} for runs from
+    before it recorded them, which show the run's settings instead."""
+    try:
+        with open(os.path.join(sample_dir, f".prompts_{name}.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return ({str(k): list(v) for k, v in data.items() if str(k).isdigit() and isinstance(v, list)}
+                if isinstance(data, dict) else {})
+    except (OSError, ValueError):
+        return {}
+
+
+def _caption_media_filter(names, family):
+    """Which of a folder's files the family trains on: an image family's captions list leaves out the folder's
+    recordings and clips. A song's waveform picture and a clip's still and sound stay, for their cards."""
+    try:
+        desc = _files_family(family) if family else None
+    except Exception:
+        desc = None
+    if desc is None:
+        return lambda n: True
+    media = set(desc.media)
+    stems = lambda exts: {os.path.splitext(n)[0] for n in names if os.path.splitext(n)[1].lower() in exts}
+    clip_stems = stems({".mp4"}) if "clip" in media else set()
+    song_stems = stems(_AUDIO) if "voice" in media else set()
+
+    def keep(n):
+        stem, e = os.path.splitext(n)
+        e = e.lower()
+        if stem in clip_stems:
+            return True
+        if e in _AUDIO:
+            return "voice" in media
+        if e in (".mp4", ".webm"):
+            return "clip" in media
+        return "photo" in media or stem in song_stems
+    return keep
 
 
 def pair_songs(entries):
@@ -1592,6 +1810,26 @@ def _thumb(path, size=320):
     return data
 
 
+_RELEASE = []
+
+
+def _newest_release(git):
+    """(tag, commit) of the newest vX.Y.Z tag on origin, asked once per run; None when it can't be reached. A pod
+    clones one commit with no tags, so its About box would otherwise show only a branch and a commit."""
+    if not _RELEASE:
+        best = None
+        for line in git("ls-remote", "--tags", "origin").splitlines():
+            sha, _, ref = line.partition("\t")
+            m = re.fullmatch(r"refs/tags/v(\d+)\.(\d+)\.(\d+)(\^\{\})?", ref.strip())
+            if not m:
+                continue
+            key = tuple(int(x) for x in m.group(1, 2, 3))
+            if best is None or key > best[0] or (key == best[0] and m.group(4)):   # ^{} = the tag's own commit
+                best = (key, f"v{key[0]}.{key[1]}.{key[2]}", sha)
+        _RELEASE.append(best[1:] if best else None)
+    return _RELEASE[0]
+
+
 def about_info() -> dict:
     """The About box's facts, as the desktop's: the running version and how this install updates."""
     def git(*a):
@@ -1605,9 +1843,13 @@ def about_info() -> dict:
         branch = git("rev-parse", "--abbrev-ref", "HEAD")
         if branch and branch != "HEAD":
             v = f"{branch} @ {v}"
+        rel = _newest_release(git)                    # the release number, from GitHub's tags (the clone has none)
+        if rel:
+            v = rel[0] if rel[1] == git("rev-parse", "HEAD") else f"{rel[0]} + later changes ({v})"
     rocm = os.environ.get("FIZGIG_GPU_BACKEND", "").lower() == "rocm"
     if on_pod():
-        how = "On RunPod, Fizgig updates itself every time you restart the pod - just stop and start it to get the latest."
+        how = ("Fizgig updates itself every time this rented GPU starts again - stop and start the pod (RunPod) or "
+               "restart the instance (Vast.ai) to get the latest.")
     elif os.name == "nt":
         how = f"To update: close Fizgig and run {'update_fizgig_rocm.bat' if rocm else 'update_fizgig.bat'}."
     else:
@@ -1741,7 +1983,7 @@ def _upload_target(folder, name, single):
     ext = os.path.splitext(name)[1].lower()
     if single:
         if ext not in UPLOAD_FILE_EXTS:
-            raise ValueError(f"{name}: not a LoRA (.safetensors), picture, clip or song.")
+            raise ValueError(f"{name}: not a LoRA (.safetensors), face model (.onnx), picture, clip or song.")
         dest = UPLOAD_FILES
     else:
         folder = _upload_name(folder, "Folder name")
@@ -1872,7 +2114,7 @@ def _fetch_status() -> dict:
     return out
 
 
-def _start_fetch(family, token="", optional=False):
+def _start_fetch(family, token="", optional=False, choices=None):
     """The family's model files plus the helper models, into <repo>/models (a pod links that to its volume), paths
     written to Preferences by the fetcher. A token is passed to that one download only, never written to disk."""
     desc = _files_family(family)
@@ -1888,6 +2130,10 @@ def _start_fetch(family, token="", optional=False):
     cmd = [sys.executable, "-m", "fizgig.scripts.fetch_models", "--progress", "--family", "tools", "--family", family]
     if optional or not desc.fetch_optional_label:
         cmd.append("--include-optional")          # no optional tick on the family: its whole list, as the desktop
+    offered = {f.pref_key for f in desc.model_files if f.fetch_choice}
+    for key, pick in (choices or {}).items():   # the card's pick for a file offered with another build
+        if key in offered and pick in ("main", "alt"):
+            cmd += ["--choose", f"{key}={pick}"]
     env = os.environ.copy()
     env.update(PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1", PYTHONPATH=os.path.join(BASE_DIR, "src"))
     if token:
@@ -1899,6 +2145,66 @@ def _start_fetch(family, token="", optional=False):
     with _lock:
         _fetch.update(proc=proc, state="running", family=family, file="", done=0, total=0, lines=[])
     threading.Thread(target=_fetch_watch, args=(proc,), daemon=True).start()
+
+
+_on_use = {}          # pref key -> {"state": "running" | "failed" | "done", "at": time}: files fetched on first use
+
+
+def _fetch_on_use(f):
+    """One model file declared fetch_on_use, downloaded the first time its feature is used: into the models folder
+    on a worker thread, its Preferences row set once it is complete (hf_hub_download writes the final name only
+    then). A failed download is tried again 30 s on, not on every form change. Returns "running" / "failed" / ""."""
+    with _lock:
+        st = _on_use.get(f.pref_key)
+        if st and (st["state"] == "running" or (st["state"] == "failed" and time.time() - st["at"] < 30)):
+            return st["state"]
+        _on_use[f.pref_key] = {"state": "running", "at": time.time()}
+
+    def work():
+        try:
+            from huggingface_hub import hf_hub_download
+            got = hf_hub_download(repo_id=f.repo, filename=f.path, local_dir=user_data.MODELS_DIR)
+            dest = os.path.join(user_data.MODELS_DIR, f.local_name or os.path.basename(f.path))
+            if os.path.normcase(os.path.abspath(got)) != os.path.normcase(os.path.abspath(dest)):
+                os.replace(got, dest)             # a file in a repo subfolder: to the models folder itself
+            update_prefs({f.pref_key: dest})
+            with _lock:
+                _on_use[f.pref_key] = {"state": "done", "at": time.time()}
+            logger.info(f"Downloaded {os.path.basename(dest)} on first use")
+        except Exception as e:
+            with _lock:
+                _on_use[f.pref_key] = {"state": "failed", "at": time.time()}
+            logger.warning(f"Couldn't download {f.path} from {f.repo}: {e}")
+
+    threading.Thread(target=work, daemon=True).start()
+    return "running"
+
+
+def _on_use_gb(f):
+    """How much of a first-use download has arrived, in GB: hf_hub_download's part file in the models folder's
+    .cache (a hashed name ending .incomplete) until it is complete - the largest there, as a resumed one may sit
+    beside an older leftover."""
+    d = os.path.join(user_data.MODELS_DIR, ".cache", "huggingface", "download", os.path.dirname(f.path))
+    try:
+        return max((os.path.getsize(os.path.join(d, n)) for n in os.listdir(d) if n.endswith(".incomplete")),
+                   default=0) / 2 ** 30
+    except OSError:
+        return 0.0
+
+
+def _look_fetch(desc, values, path):
+    """The preview look LoRA (MOSS-Image's SFT look LoRA), ticked on the Samples tab: its own download
+    (_fetch_on_use) when it is not on disk. Returns (state, GB arrived of GB): state "running" / "failed" / "done"
+    (just finished: the note says so) / "" (nothing to say)."""
+    look = desc.preview_look()
+    if look is None or not look.fetch_on_use or not values.get("FAMILY_PREVIEW_LOOK"):
+        return "", None
+    if path and os.path.isfile(path):
+        with _lock:
+            st = _on_use.get(look.pref_key) or {}
+        return ("done" if st.get("state") == "done" and time.time() - st["at"] < 120 else ""), None
+    state = _fetch_on_use(look)
+    return state, ((_on_use_gb(look), look.size_gb) if state == "running" else None)
 
 
 def _fetch_watch(proc):
@@ -1927,7 +2233,31 @@ def _caption_gpu_check(need_gb):
     if not mine:
         return
     g = _chosen_gpu(list_gpus(), os.environ.get("CUDA_VISIBLE_DEVICES") or load_prefs().get("cuda_device"))
-    free = (g["total_gb"] - g["used_gb"]) if g else 0.0
+    if g is None:
+        free = 0.0
+        # ROCm launch only (#188). NVIDIA path keeps free=0 when list_gpus is empty (same as before).
+        if _rocm_launch():
+            try:
+                from fizgig.utils.vram_monitor import read_amd_gpu_vram
+                hit = read_amd_gpu_vram()
+                if hit and hit[1] > 0:
+                    free = (hit[1] - hit[0]) / 2 ** 30
+            except Exception:
+                pass
+    else:
+        free = g["total_gb"] - g["used_gb"]
+        # ROCm synthetic row (uuid ""): typeperf may still report used=0 before its first sample - refuse
+        # captioning beside a run until a real used reading exists.
+        if _rocm_launch() and g.get("uuid") == "" and g["used_gb"] <= 0 and free >= need_gb + 3.0:
+            try:
+                from fizgig.utils.vram_monitor import read_amd_gpu_vram
+                hit = read_amd_gpu_vram()
+                if hit is None or hit[0] <= 0:
+                    free = 0.0
+                else:
+                    free = (hit[1] - hit[0]) / 2 ** 30
+            except Exception:
+                free = 0.0
     if free < need_gb + 3.0:
         raise ValueError(f"A run is training and the card has {free:.0f} GB free; this needs about {need_gb + 3:.0f} GB "
                          f"beside it. Wait for the run to finish, or pause it.")
@@ -2049,9 +2379,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _cookie(self, remember=False):
         """The login cookie: for 30 days on this device with Keep me logged in, else until the browser closes.
-        Secure through a pod's HTTPS proxy."""
+        Secure through a RunPod pod's HTTPS proxy (a Vast.ai instance's ports are plain http: a Secure cookie would
+        never be kept there)."""
         return ("Set-Cookie", f"fizgig_session={self._session()}; Path=/; HttpOnly; SameSite=Strict"
-                              + ("; Max-Age=2592000" if remember else "") + ("; Secure" if on_pod() else ""))
+                              + ("; Max-Age=2592000" if remember else "") + ("; Secure" if on_runpod() else ""))
 
     def _logged_in(self):
         if not self.password:
@@ -2135,8 +2466,10 @@ class Handler(BaseHTTPRequestHandler):
                                       "key_saved": bool(str(p.get("runpod_api_key") or "").strip()),
                                       "key_env": bool((os.environ.get("RUNPOD_STOP_API_KEY") or "").strip()),
                                       "pod_id": __import__("fizgig.web.pod_stop", fromlist=["x"]).pod_id(),
-                                      "storage": pod_storage()}
-                              if on_pod() else None,
+                                      "storage": pod_storage(), "provider": "vast" if on_vast() and not on_runpod()
+                                      else "runpod", "https": __import__("fizgig.web.pod_stop",
+                                                                         fromlist=["x"]).tunnels().get("web", "")}
+                              if on_runpod() or on_vast() else None,     # the rented GPU's own card
                               "gpu_env_locked": bool(os.environ.get("CUDA_VISIBLE_DEVICES"))})
         if path == "/api/state":
             st = load_state()
@@ -2327,7 +2660,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/prep/options":            # Image Prep: its choices, and whether face tools are here
             from fizgig.dataset import prep as _prep
             return self.json({"modes": list(_prep.MODES), "megapixels": _prep.MEGAPIXELS,
-                              "faces": _prep.FACE_TARGETS, "face_tools": prep_jobs.faces_available()})
+                              "faces": _prep.FACE_TARGETS, "face_tools": prep_jobs.faces_available(),
+                              "face_settings": prep_jobs.face_settings()})
         if path == "/api/prep/summary":            # the What will happen card
             from fizgig.dataset import prep as _prep
             g = lambda k, d="": (qs.get(k) or [d])[0]
@@ -2520,7 +2854,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json({"error": "not a checkpoint"}, 404)
             return self._stream(p)
         if path == "/api/captions":
-            return self._captions((qs.get("folder") or [""])[0], (qs.get("ext") or [".txt"])[0])
+            return self._captions((qs.get("folder") or [""])[0], (qs.get("ext") or [".txt"])[0],
+                                  (qs.get("family") or [""])[0])
         return self.json({"error": "not found"}, 404)
 
     def _log_stream(self, since):
@@ -2566,7 +2901,17 @@ class Handler(BaseHTTPRequestHandler):
             for e in sorted(os.scandir(target), key=lambda e: e.name.lower()):
                 if e.name.startswith("."):
                     continue
-                (dirs if e.is_dir() else files).append({"name": e.name, "path": e.path})
+                isdir = e.is_dir()
+                item = {"name": e.name, "path": e.path}
+                try:                                 # dates and size for the picker's columns (stat is cached on Windows)
+                    st = e.stat()
+                    item["mtime"] = st.st_mtime
+                    item["ctime"] = getattr(st, "st_birthtime", None) or (st.st_ctime if os.name == "nt" else None)
+                    if not isdir:
+                        item["size"] = st.st_size
+                except OSError:
+                    pass
+                (dirs if isdir else files).append(item)
         except OSError:
             pass
         parent = os.path.dirname(target)
@@ -2594,8 +2939,17 @@ class Handler(BaseHTTPRequestHandler):
         if run:
             items = [e for e in items if infos[e.name].get("run") == run]
         out = pair_songs([(e.name, e.path, {"time": e.stat().st_mtime, **infos[e.name]}) for e in items[:1500]])
-        return self.json({"items": out[:1000] if run else out[:300], "runs": runs,
-                          "prompts": run_prompts(os.path.dirname(folder.rstrip("\\/")), run) if run else []})
+        by_epoch = epoch_prompts(folder, run) if run else {}
+        try:
+            with open(os.path.join(folder, f".previews_{run}.json"), encoding="utf-8") as f:
+                mode = json.load(f) if run else None
+        except (OSError, ValueError):
+            mode = None
+        newest = by_epoch[max(by_epoch, key=int)] if by_epoch else None
+        return self.json({"items": out[:1000] if run else out[:300], "runs": runs, "epoch_prompts": by_epoch,
+                          "preview_mode": mode if isinstance(mode, dict) else None,
+                          "preview_labels": preview_labels(mode),
+                          "prompts": newest or (run_prompts(os.path.dirname(folder.rstrip("\\/")), run) if run else [])})
 
     def _checkpoints(self, folder):
         """The run's saved LoRAs / checkpoints in its output folder, newest first."""
@@ -2611,20 +2965,20 @@ class Handler(BaseHTTPRequestHandler):
                                      "time": e.stat().st_mtime, "kind": _checkpoint_kind(e.path),
                                      "run": base(e.name)} for e in items]})
 
-    def _captions(self, folder, ext):
+    def _captions(self, folder, ext, family=""):
         out = []
         try:
             names = sorted(os.listdir(folder))
         except OSError:
             return self.json({"items": []})
+        keep = _caption_media_filter(names, family)
         for n in names:
             stem, e = os.path.splitext(n)
-            if e.lower() not in MEDIA:
+            if e.lower() not in MEDIA or not keep(n):
                 continue
             cap = os.path.join(folder, stem + ext)
             try:
-                with open(cap, encoding="utf-8") as f:
-                    text = f.read()
+                text = captions.read_text(cap)          # any encoding: one odd file never empties the list (#225)
             except OSError:
                 text = None
             p = os.path.join(folder, n)
@@ -2682,7 +3036,9 @@ class Handler(BaseHTTPRequestHandler):
                 # on a pod everyone arrives through RunPod's proxy (one address), so the visitor is the address the
                 # proxy adds - the LAST in X-Forwarded-For (earlier ones are whatever the visitor sent). Off a pod the
                 # header could be forged outright, so the connection's own address counts.
-                fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip() if on_pod() else ""
+                fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip() if on_runpod() else ""
+                if on_vast() and self.client_address[0] == "127.0.0.1":   # through the Vast image's https tunnel:
+                    fwd = (self.headers.get("Cf-Connecting-Ip") or "").strip()  # Cloudflare names the visitor
                 ip, now = fwd or self.client_address[0], time.time()
                 with _login_lock:
                     n, until, last = _login_fails.get(ip, (0, 0.0, 0.0))
@@ -2739,10 +3095,22 @@ class Handler(BaseHTTPRequestHandler):
                 ck = desc.preview_checkpoint()
                 ckf = pref_path(prefs, ck[0].pref_key) if ck else ""
                 vals = b.get("values") or {}
+                lk = desc.preview_look()
+                lkf = launch.look_path(desc, {"models": {lk.pref_key: pref_path(prefs, lk.pref_key)}}) if lk else ""
+                dit = next((f.pref_key for f in desc.model_files if f.role == "dit"), "")
                 st = form.state(desc, vals, b.get("image_folder") or "",
                                 captioner=cap if cap and os.path.isfile(cap) else "",
                                 speed_file=bool(spf and os.path.isfile(spf)),
-                                checkpoint_file=bool(ckf and os.path.isfile(ckf)))
+                                checkpoint_file=bool(ckf and os.path.isfile(ckf)),
+                                base_file=pref_path(prefs, dit) if dit else "",
+                                checkpoint_path=ckf if ckf and os.path.isfile(ckf) else "",
+                                look_file=bool(lkf and os.path.isfile(lkf)), look_fetch=_look_fetch(desc, vals, lkf))
+                if st["kind"] in ("standard", "finetune"):     # the Subjects card: what each folder trains as
+                    mpn = _multi_person_notes(vals, b.get("image_folder") or "",
+                                              multi_person=st["kind"] == "standard" and
+                                              bool(vals.get("FAMILY_MULTI_PERSON")))
+                    st["placeholders"] = mpn.pop("__placeholders", {})
+                    st["notes"].update(mpn)
                 if st["kind"] == "finetune" and desc.finetune:      # the fine-tune card's plan line (the desktop's)
                     from fizgig.web import ft_plan
                     st["notes"]["FAMILY_FT_ROTATIONS"], st["pending"] = ft_plan.line(
@@ -2884,6 +3252,10 @@ class Handler(BaseHTTPRequestHandler):
                 for k in _SIZE_KEYS:                     # Resume at the size the form has now: caches again first
                     if str(b.get(k) or "").strip():
                         last["values"][k] = str(b[k]).strip()
+                samples = b.get("samples") if isinstance(b.get("samples"), dict) else {}
+                for k in _RESUME_SAMPLE_KEYS:            # the previews as the Samples tab has them now
+                    if k in samples and samples[k] is not None and str(samples[k]).strip() != "":
+                        last["values"][k] = samples[k]
                 if last["resume_mode"] == "ft":
                     if not os.path.isfile(last["resume"]):
                         return self.json({"error": "The paused fine-tune's checkpoint isn't there any more: "
@@ -2896,15 +3268,15 @@ class Handler(BaseHTTPRequestHandler):
                                                    f"for is {v.get('FAMILY_FT_ROTATIONS')}: "
                                                    f"{os.path.basename(last['resume'])} is the finished model. To "
                                                    f"train it further, raise Train for and press Resume again."}, 400)
-                    return self.json(_start(last["family"], v, last["image_folder"],
+                    return self.json(_resumed(_start(last["family"], v, last["image_folder"],
                                             ft_continue={"continue": cont, "rotations": left},
                                             note=f"=== Resuming the fine-tune from {os.path.basename(last['resume'])}: "
-                                                 f"{left} rotation(s) left ==="))
+                                                 f"{left} rotation(s) left ===")))
                 if not os.path.isdir(last["resume"]):
                     return self.json({"error": "The paused run's saved state isn't there any more: "
                                                + last["resume"]}, 400)
-                return self.json(_start(last["family"], last["values"], last["image_folder"], resume=last["resume"],
-                                        note=f"=== Resuming from {last['resume']} ==="))
+                return self.json(_resumed(_start(last["family"], last["values"], last["image_folder"],
+                                                 resume=last["resume"], note=f"=== Resuming from {last['resume']} ===")))
             if path == "/api/run/slider_prompts":    # a prompt slider's new ends, taken at its next epoch boundary
                 with _lock:
                     running = _run["proc"] is not None and _run["proc"].poll() is None
@@ -2931,6 +3303,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/run/sample_override":   # the Samples tab's live previews: the run going now's override
                 with _lock:
                     out = _run["output_dir"] if _run["proc"] is not None and _run["proc"].poll() is None else ""
+                    fam = _run["family"]
                 if not out:
                     return self.json({"error": "Nothing is training right now."}, 400)
                 side = os.path.join(out, ".sample_override.json")
@@ -2941,8 +3314,23 @@ class Handler(BaseHTTPRequestHandler):
                     except OSError:
                         pass
                     return self.json({"ok": True, "on": False})
-                _write_json(side, {"prompts": prompts, "seed": _seed(b.get("seed"), 1234),
-                                   "width": _seed(b.get("width"), 1024), "height": _seed(b.get("height"), 1024)})
+                live = {"prompts": prompts, "seed": _seed(b.get("seed"), 1234),
+                        "width": _seed(b.get("width"), 1024), "height": _seed(b.get("height"), 1024)}
+                for k in ("steps", "cfg", "turbo", "every", "until", "after"):   # Steps, CFG, Turbo strength and
+                    # the preview cadence (until / after 0 = Then preview less often off), when given
+                    try:
+                        if str(b.get(k, "")).strip() != "":
+                            live[k] = float(b[k]) if k in ("cfg", "turbo") else int(float(b[k]))
+                    except (TypeError, ValueError):
+                        pass
+                desc = get_family(fam or "")
+                lk = desc.preview_look() if desc is not None and "look" in b else None
+                if lk is not None:      # the SFT look tick: its file's path when ticked ("" = off), at its strength
+                    live["look"] = launch.look_path(desc, {"models": {lk.pref_key: pref_path(load_prefs(),
+                                                                                            lk.pref_key)}}) \
+                        if b.get("look") else ""
+                    live["look_strength"] = desc.preview_look_strength
+                _write_json(side, live)
                 return self.json({"ok": True, "on": True})
             if path == "/api/run/now":               # Sample now / Save now: a request the trainer takes after a step
                 what = str(b.get("what") or "")
@@ -2972,7 +3360,8 @@ class Handler(BaseHTTPRequestHandler):
                 append_log("\n⏸ Pause requested: the run stops cleanly at the end of this epoch.\n")
                 return self.json({"ok": True})
             if path == "/api/fetch":
-                _start_fetch(b.get("family", ""), b.get("token", ""), bool(b.get("optional")))
+                _start_fetch(b.get("family", ""), b.get("token", ""), bool(b.get("optional")),
+                             b.get("choices") if isinstance(b.get("choices"), dict) else None)
                 return self.json({"ok": True})
             if path == "/api/fetch/cancel":
                 return self.json({"ok": _cancel_fetch()})
@@ -3055,9 +3444,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json({"error": "Set a password first (Preferences > Web UI)."}, 400)
                 from fizgig.web import pod_stop
                 from fizgig.web.port import lan_ip
-                if on_pod():
+                if on_runpod():
                     pid = pod_stop.pod_id()
                     base = f"https://{pid}-8081.proxy.runpod.net/" if pid else ""
+                elif on_pod():                      # a Vast.ai instance: its https tunnel, else its public address
+                    ip, vp = os.environ.get("PUBLIC_IPADDR"), os.environ.get("VAST_TCP_PORT_8081")
+                    web = pod_stop.tunnels().get("web", "")
+                    base = web.rstrip("/") + "/" if web else f"http://{ip}:{vp}/" if ip and vp else ""
                 else:
                     ip = lan_ip()
                     base = f"http://{ip}:{self.server.server_address[1]}/" if ip else ""
@@ -3145,6 +3538,12 @@ class Handler(BaseHTTPRequestHandler):
                                                          captions.caption_ext(b.get("ext"))))
                 except ValueError as e:
                     return self.json({"error": str(e)}, 400)
+            if path == "/api/prep/face_settings":     # the face finder / YOLO model / look match (prefs.json face_*)
+                try:
+                    update_prefs(prep_jobs.save_face_settings(b))
+                    return self.json(prep_jobs.face_settings())
+                except ValueError as e:
+                    return self.json({"error": str(e)}, 400)
             if path == "/api/prep/test":              # Test face detection on one photo (writes nothing)
                 try:
                     return self.json(prep_jobs.test_faces(str(b.get("path") or ""), str(b.get("face") or "")))
@@ -3168,6 +3567,14 @@ class Handler(BaseHTTPRequestHandler):
                     r = json.loads(line) if line else {"error": (p.stderr or "Whisper didn't answer").strip()[-300:]}
                 except subprocess.TimeoutExpired:
                     r = {"error": "Whisper took too long on this clip."}
+                return self.json(r, 400 if r.get("error") else 200)
+            if path == "/api/captions/trigger_check":     # a trigger word against the model's own tokenizer
+                from fizgig.families import trigger_check
+                try:
+                    r = trigger_check.check(str(b.get("family") or ""), str(b.get("trigger") or ""),
+                                            str(b.get("cls") or ""), [str(o) for o in b.get("others") or []])
+                except Exception as e:                     # the tokenizer couldn't be fetched (offline, first use)
+                    r = {"error": f"Couldn't load this model's tokenizer: {e}"}
                 return self.json(r, 400 if r.get("error") else 200)
             if path == "/api/captions/static":
                 _, folder, clips, photos, voice = _caption_args(b)
@@ -3639,9 +4046,11 @@ def main(argv=None):
     saved = str(load_prefs().get("web_password") or "").strip()
     pwd = (a.password or os.environ.get("FIZGIG_PASSWORD")
            or ((os.environ.get("VNC_PASSWORD") or saved) if on_pod() else saved))
-    pod_pwd = on_pod() and not a.password and not os.environ.get("FIZGIG_PASSWORD") and pwd == os.environ.get(
+    # a RunPod pod's own VNC password is taken at any length (it opens its remote desktop too); anywhere else the
+    # image runs (Vast.ai: plain http on a public address) a password is 8 characters or more, as at home
+    pod_pwd = on_runpod() and not a.password and not os.environ.get("FIZGIG_PASSWORD") and pwd == os.environ.get(
         "VNC_PASSWORD")
-    if pwd and len(pwd) < 8 and not pod_pwd:          # a pod's own VNC password is taken at any length
+    if pwd and len(pwd) < 8 and not pod_pwd:
         sys.exit("The web UI password needs at least 8 characters (Preferences > Web UI, web_password in "
                  "prefs.json, FIZGIG_PASSWORD or --password).")
     host = a.host or ("0.0.0.0" if pwd else "127.0.0.1")

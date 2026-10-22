@@ -6,6 +6,20 @@ Fizgig in your browser: the pod runs the app and you open it as a web page, from
 
 *That link is a referral one — it supports Fizgig's development at no extra cost to you.*
 
+Prefer Vast.ai? The same image runs there too: [Fizgig on Vast.ai](https://cloud.vast.ai/?ref_id=757773&creator_id=757773&name=Fizgig%20LoRa%20Training%20and%20Fine-tuning) (also a referral link) · [the Vast.ai guide](../docs/VAST.md).
+
+## Quick start: nothing installed on your computer
+
+You don't need Fizgig on your own computer for this. You need a RunPod account and a web browser.
+
+1. **Click [Deploy on RunPod](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep).** It opens RunPod with the Fizgig template and an RTX 5090 chosen. Keep the template's 300 GB disk and press **Deploy**. (Other cards: [Which GPU](#which-gpu).)
+2. **Wait for "Ready".** Open the pod's **Logs** tab. The first start downloads the image and takes a few minutes. It's ready when the log ends with `Ready. Open the pod's HTTP port 8081 for Fizgig.` and the password on the line under it.
+3. **Open Fizgig in your browser.** In the pod's **Connect** menu, click **HTTP port 8081** and log in with that password (there's no user name). That page is Fizgig, the whole app.
+4. **Download a model.** **Preferences → ⬇ Download models for me.** Krea 2 needs no Hugging Face account.
+5. **Train.** On the **Start** tab, **Upload a training folder**, then on the **Training** tab press **Start**.
+
+Close the tab whenever you like: the run carries on, and you can come back from any browser, your phone included. **Stop** the pod between sessions to keep everything on its disk; terminating it deletes the disk ([Storage](#storage)). The rest of this page has the detail on each step.
+
 **Need the old pod?** The previous template, with the classic app in a remote desktop, stays available as **[Fizgig Classic v7.x](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)**: see [the classic template](#the-classic-template-remote-desktop) below. Pods you already have keep running as they are.
 
 ---
@@ -136,6 +150,10 @@ It needs an API key, pasted into that same panel. Make one at **RunPod → Setti
 key RunPod gives a pod automatically is pod-scoped and cannot stop pods, which is a RunPod
 limitation rather than a Fizgig one. It's stored on your volume, not in any template.
 
+**Stopping a pod yourself mid-run** loses what the run trained since its last save: the pod gets a few seconds'
+notice, not the minutes an epoch can take. Press **Pause** first (it saves and stops at the end of the epoch), then
+stop the pod.
+
 ## Settings
 
 Environment variables, set on the deploy screen under **Edit Template**:
@@ -151,6 +169,10 @@ Nothing is compulsory — the defaults are the intended setup, and everything he
 inside the app instead.
 
 Two more exist for unusual cases: `FETCH_MODELS_EXTRA` passes extra flags to the downloader, and `FIZGIG_REPO` points the pod at a fork.
+
+## On Vast.ai
+
+The same image runs on Vast.ai, with its own template: see [Fizgig on Vast.ai](../docs/VAST.md).
 
 ## The classic template (remote desktop)
 

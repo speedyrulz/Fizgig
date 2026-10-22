@@ -290,6 +290,17 @@ class ItemInfo:
 # Cache I/O — Fizgig-native format
 # ---------------------------------------------------------------------------
 
+def source_stamp(path) -> str:
+    """"size:mtime" of the picture a latent cache was made from, kept in the cache's metadata ("source"): any change
+    re-encodes it, older or newer - a copied-in photo keeps its own date, so "newer than the cache" misses a folder
+    refilled with someone else's photos under the same names. "" when the file can't be read."""
+    try:
+        st = os.stat(path)
+        return f"{st.st_size}:{int(st.st_mtime)}"
+    except (OSError, TypeError):
+        return ""
+
+
 def save_latent_cache(
     item_info: ItemInfo,
     latent: torch.Tensor,
@@ -313,6 +324,7 @@ def save_latent_cache(
         "height": str(item_info.original_size[1]),
         "dtype": dtype_to_str(latent.dtype),
         "format_version": "2.0.0",
+        "source": source_stamp(item_info.item_key),
     }
 
     # NaN guard
@@ -593,6 +605,10 @@ class BucketBatchManager:
         # Per-image identity for the (passive) per-image loss logger. Harmless list of strings that
         # trainers ignore unless logging is enabled.
         stacked["item_keys"] = [item_info.item_key for item_info in bucket[start:end]]
+        # the key is the file's name, so two folders' IMG_0001s share one; the text cache path is the item's own
+        # (each folder caches in its own folder) - DOP's per-item caption and targets key on it
+        stacked["item_te_paths"] = [str(getattr(item_info, "text_encoder_output_cache_path", "") or "")
+                                    for item_info in bucket[start:end]]
 
         return stacked
 
@@ -617,8 +633,12 @@ class ImageDirectoryDatasource:
         control_directory: Optional[str] = None,
         extra_extensions: tuple = (),
         family=None,
+        caption_replace=None,
         extra_reference_directory: Optional[str] = None,
     ):
+        import re
+        self.caption_replace = [(re.compile(r"(?<!\w)" + re.escape(str(a)) + r"(?!\w)", re.I), str(b))
+                                for a, b in (caption_replace or []) if str(a)]
         self.image_directory = image_directory
         self.caption_extension = caption_extension
         self.control_directory = control_directory
@@ -783,7 +803,10 @@ class ImageDirectoryDatasource:
             return image_path, ""
         with open(caption_path, "rb") as f:
             raw = f.read()
-        return image_path, decode_caption(raw, caption_path).strip()
+        caption = decode_caption(raw, caption_path).strip()
+        for pat, to in self.caption_replace:
+            caption = pat.sub(lambda _m, t=to: t, caption)
+        return image_path, caption
 
     def __iter__(self):
         self._current_idx = 0
@@ -836,6 +859,8 @@ class ImageDataset(torch.utils.data.Dataset):
         architecture: str = ARCHITECTURE_KLEIN_9B,
         is_reg: bool = False,
         clip_megapixels: Optional[float] = None,
+        caption_replace: Optional[list] = None,
+        photos_only: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -875,12 +900,18 @@ class ImageDataset(torch.utils.data.Dataset):
         # orphan and the run trains on nothing.
         self.family = _described_family(architecture)
         _media = tuple(getattr(self.family, "media", ()) or ())
-        _extra = ((VIDEO_EXTENSIONS if "clip" in _media else ()) +
-                  (AUDIO_EXTENSIONS if "voice" in _media else ()))
+        _extra = () if photos_only else ((VIDEO_EXTENSIONS if "clip" in _media else ()) +
+                                         (AUDIO_EXTENSIONS if "voice" in _media else ()))
         self.extra_extensions = _extra
+        if photos_only and os.path.isdir(image_directory):
+            _left = [f for f in os.listdir(image_directory)
+                     if os.path.splitext(f)[1].lower() in {e.lower() for e in VIDEO_EXTENSIONS + AUDIO_EXTENSIONS}]
+            if _left:
+                logger.info(f"[isolation] {len(_left)} clip/voice file(s) in {image_directory} left out: "
+                            f"Fizgig LoRA Isolation trains people from their photos")
         self.datasource = ImageDirectoryDatasource(image_directory, caption_extension,
                                                    control_directory, extra_extensions=_extra,
-                                                   family=self.family,
+                                                   family=self.family, caption_replace=caption_replace,
                                                    extra_reference_directory=extra_reference_directory)
 
         if self.cache_directory is None:

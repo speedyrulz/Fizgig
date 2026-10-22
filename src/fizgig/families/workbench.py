@@ -118,6 +118,7 @@ class WorkbenchEngine:
     def __init__(self, description):
         self.desc = description
         self.driver = description.load_driver()
+        self.driver.keep_text_encoder = True
         self.pipeline = None
         self.dit = self.vae = self.net = None
         self.te_path = None
@@ -184,7 +185,8 @@ class WorkbenchEngine:
 
     # ---- models -------------------------------------------------------------------------------------
     def ensure_pipeline(self, dit_path, vae_path, text_encoder_path, speed_lora_path="", device="cuda",
-                        lowmem=None, precision="auto", blocks_to_swap=0, preview_sampling=None, **_ignored):
+                        lowmem=None, precision="auto", blocks_to_swap=0, preview_sampling=None,
+                        speed_on_checkpoint=False, **_ignored):
         """Load the DiT (resident) and the VAE once; the text encoder loads per new prompt. speed_lora_path: the
         family's speed LoRA file, attached unmerged and used for every preview ("" = default sampling).
         precision: "auto" = bf16 when the model file fits the free VRAM with 6 GB to spare (Qwen 2.1's 14 GB: 20 GB
@@ -194,7 +196,8 @@ class WorkbenchEngine:
         if self.pipeline is not None:
             return
         self.checkpoint_sampling = preview_sampling
-        if preview_sampling is not None:
+        self.speed_on_checkpoint = bool(speed_on_checkpoint and preview_sampling is not None)
+        if preview_sampling is not None and not self.speed_on_checkpoint:
             speed_lora_path = ""
         from fizgig.families.train import _small_card_previews
         self.device = device
@@ -301,7 +304,7 @@ class WorkbenchEngine:
         if self.donor_network is not None:
             raise RuntimeError("Donor already loaded — unload_donor() or reset() first.")
         self._attach(path, DONOR)
-        # The donor comes in through its block sliders only (strength 0 by default); anything it adapts outside
+        # The donor comes in through its block sliders only (fully on by default); anything it adapts outside
         # the block map stays off, as on the other engines.
         self.net.set_outside(DONOR, False)
         self._clear_blend_state(DONOR)
@@ -560,7 +563,9 @@ class WorkbenchEngine:
                (ref, int(size[0]), int(size[1])) if kind == "edit" else ()) + tuple(self.driver.text_cache_key())
         need = [p for p in prompts if (p,) + tag not in self._prompt_cache]
         if need:
-            te_gb = os.path.getsize(self.te_path) / 1024 ** 3 if os.path.exists(self.te_path) else 0.0
+            te_gb = self.driver.text_encoder_gb(self.te_path)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()             # the last render's cached blocks are not in use
             park = self.lowmem or _free_vram_gb() < te_gb + 2.0
             if park:
                 self._park_dit("cpu")
@@ -626,9 +631,11 @@ class WorkbenchEngine:
     def sampling(self):
         """(steps, cfg, sigmas, options) previews use."""
         ps = self.preview_settings
-        if ps is not None and getattr(self, "checkpoint_sampling", None) is None:
+        if ps is not None and (getattr(self, "checkpoint_sampling", None) is None
+                               or getattr(self, "speed_on_checkpoint", False)):
             self._follow_speed()
-            s = self.speed.settings if self.speed is not None else self.desc.default_sampling()
+            s = self.speed.settings if self.speed is not None else (
+                getattr(self, "checkpoint_sampling", None) or self.desc.default_sampling())
             try:
                 steps = int(ps.get("steps")) or s.steps
             except (TypeError, ValueError):
@@ -868,10 +875,12 @@ class WorkbenchEngine:
         neg = None
         ps = self.preview_settings
         try:
-            if ps is not None and float(self.sampling()[1] or 1.0) > 1.0:     # the CFG this render uses (a preview
-                #                                                          checkpoint has its own: Qwen's Turbo, CFG 1)
-                # the Samples tab's negative, seen the same way as the prompt (an edit's reference included)
-                neg = self.encode([str(ps.get("negative") or "")], ref=("" if override_ctx is not None else ref),
+            if float(self.sampling()[1] or 1.0) > 1.0:     # the CFG this render uses (a preview checkpoint has
+                #                                            its own: Qwen's Turbo, CFG 1)
+                # the Samples tab's negative (with no Samples settings, the family's default), seen the same way as
+                # the prompt (an edit's reference included)
+                text = ps.get("negative") if ps is not None else self.desc.preview_negative
+                neg = self.encode([str(text or "")], ref=("" if override_ctx is not None else ref),
                                   ref_mp=ref_mp, size=(width, height))[0]
         except (TypeError, ValueError):
             neg = None
@@ -936,12 +945,21 @@ class WorkbenchEngine:
                self._settings_key())
         if self._baseline_key == key and self._baseline_img is not None:
             return self._baseline_img
+        if self.same_as_baseline(state):
+            # nothing moved: the tweaked render IS the baseline - one render for both panes, and it fills Turbo
+            # Preview's cache for the first slider move
+            img = self.generate_preview(state)
+            self._baseline_key, self._baseline_img = key, img
+            return img
         base = self.default_state(state.preview_width, state.preview_height)
         base.seed, base.prompt = state.seed, state.prompt
         base.ref_image_path = getattr(state, "ref_image_path", "")
         base.ref_megapixels = getattr(state, "ref_megapixels", 1.0)
         base.ref_strength = getattr(state, "ref_strength", 1.0)
         base.primary_scale = float(getattr(state, "primary_scale", 1.0))
+        base.donor_scale = 0.0              # the primary alone: a loaded donor stays out of the left pane
+        for bs in base.blocks.values():
+            bs.donor_enabled = False
         self._act_bypass = True             # the baseline would overwrite the tweaked render's cache
         try:
             img = self.generate_preview(base)
@@ -949,6 +967,16 @@ class WorkbenchEngine:
             self._act_bypass = False
         self._baseline_key, self._baseline_img = key, img
         return img
+
+    def same_as_baseline(self, state):
+        """True when the tweaked render would be the baseline: every primary block on at 1.0 and no donor block
+        contributing (no donor, its load strength 0, or each of its blocks off or at 0)."""
+        if any(not bs.primary_enabled or float(bs.primary_strength) != 1.0 for bs in state.blocks.values()):
+            return False
+        if self.donor_network is None or float(getattr(state, "donor_scale", 1.0)) == 0.0:
+            return True
+        return not any(bs.donor_enabled and float(bs.donor_strength) != 0.0
+                       for b, bs in state.blocks.items() if b in self.donor_block_ids)
 
     def _invalidate_baseline_cache(self):
         self._baseline_key = self._baseline_img = None
@@ -1078,6 +1106,7 @@ class WorkbenchEngine:
         self._clear_blend_state()
         self._eq = {}
         self._prompt_cache = {}
+        getattr(self.driver, "drop_text_encoder", lambda: None)()
         self._invalidate_baseline_cache()
         self._invalidate_activation_cache()
         self._act_modules = None

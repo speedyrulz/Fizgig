@@ -82,7 +82,8 @@ async function boot() {
     for (const f of S.schema.families) sel.append(el("option", {value: f.key, text: f.gui_label || f.display_name}));
   }
   await chooseFamily(st.family && S.schema.order.includes(st.family) ? st.family : S.schema.order[0]);
-  if (st.tab) showTab(st.tab);
+  showTab("start");                // Fizgig always opens on Start (its News card), never the last tab used
+  newsCard();
   wire();
   $("podsTabBtn").style.display = S.onPod ? "none" : "";      // on a pod there's nothing to connect to
   $("sideDeploy").style.display = S.onPod ? "none" : "";      // ...nor a pod to deploy
@@ -114,7 +115,9 @@ async function chooseFamily(key) {
     }
   }
   if (S.trigger !== undefined) S.values.CAPTION_TRIGGER_WORD = S.trigger;     // the folder's, not the model's
-  S.values.__SAMPLE_LIVE = false;            // a live preview change is for one run, never remembered
+  // on whenever a form loads: a change made here while a run trains goes to its next previews (only a change is
+  // sent, so a run started from the queue keeps its own prompts until you change something)
+  S.values.__SAMPLE_LIVE = true;
   renderAll();
   await refreshState();
   saveState();
@@ -135,12 +138,19 @@ const saveTriggerSoon = debounce((word) => api("/api/trigger", {folder: S.imageF
 
 function defaults() {
   const v = {};
-  for (const s of S.fam.form.sections) for (const r of s.rows) if (r.kind !== "note" && r.kind !== "shown") v[r.key] = r.default;
+  for (const s of S.fam.form.sections) for (const r of s.rows) if (r.kind !== "note" && r.kind !== "shown") {
+    v[r.key] = r.default;
+    for (const p of r.parts || []) v[p.key] = p.default;   // a control of several values (the preview cadence)
+  }
   return v;
 }
 
 function renderAll() {
   $("familyNotes").textContent = S.fam.model_note || "";
+  for (const st of document.querySelectorAll(".family-status")) {    // the model's status line (description status_note)
+    st.textContent = S.fam.status_note || "";
+    st.style.display = S.fam.status_note ? "" : "none";
+  }
   renderSections("samples", $("samplesForm"));
   renderSections("training", $("trainingForm"));
   renderPresets();
@@ -152,13 +162,84 @@ function renderAll() {
 }
 
 // ---- the generated forms -----------------------------------------------------------------------------------
+// ---- Check a trigger word: under the Subjects card, collapsed. The training model's own text encoder reads the word
+// the way Fizgig LoRA Isolation joins it ("zwxem, a woman" -> zwxemwoman); values kept across the card's re-draws
+S.tc = {open: false, word: "", cls: "woman", others: ""};
+
+function triggerCheckBlock() {
+  const name = (S.fam && (S.fam.gui_label || S.fam.display_name)) || "this model";
+  const word = el("input", {type: "text", class: "w-combo", placeholder: "e.g. zwxem", value: S.tc.word});
+  const cls = el("select", {class: "w-combo"});
+  for (const [v, t] of [["woman", "a woman"], ["man", "a man"], ["girl", "a girl"], ["boy", "a boy"],
+                        ["person", "a person"], ["dog", "a dog"], ["cat", "a cat"], ["horse", "a horse"],
+                        ["", "a style or look"]])
+    cls.append(el("option", {value: v, text: t}));
+  cls.value = S.tc.cls;
+  const others = el("input", {type: "text", class: "w-combo-lg", placeholder: "e.g. dlor, gwelt", value: S.tc.others});
+  const result = el("div");
+  const run = async () => {
+    S.tc.word = word.value.trim(); S.tc.cls = cls.value; S.tc.others = others.value;
+    result.innerHTML = "";
+    if (!S.tc.word) { result.append(el("div", {class: "field-hint", text: "Type a trigger word first."})); return; }
+    result.append(el("div", {class: "field-hint", text: "Checking…"}));
+    let r;
+    try {
+      r = await api("/api/captions/trigger_check", {family: S.family, trigger: S.tc.word, cls: cls.value,
+        others: others.value.split(",").map((s) => s.trim()).filter(Boolean)});
+    } catch (e) { result.innerHTML = ""; result.append(el("div", {class: "field-hint", text: String(e.message || e)})); return; }
+    result.innerHTML = "";
+    const clean = r.ok && !r.notes.length;
+    result.append(el("div", {class: "tc-verdict " + (clean ? "tc-good" : r.ok ? "tc-warn" : "tc-bad"),
+      text: (clean ? "✓ Good word. " : r.ok ? "Joins cleanly, with a note below. " : "✗ ") +
+            (clean || r.ok ? `${r.joined} reads as ${r.pieces.join(" | ")}` : r.notes[0])}));
+    for (const n of (r.ok ? r.notes : r.notes.slice(1))) result.append(el("div", {class: "field-hint", text: "• " + n}));
+    if (r.encoder) result.append(el("div", {class: "field-hint", text: `Checked with ${r.encoder}.`}));
+    if (r.suggestions && r.suggestions.length) {
+      const row = el("div", {class: "field-row"},
+        el("span", {class: "field-hint", text: "Made-up words that work here (click one to check it):"}));
+      for (const s of r.suggestions)
+        row.append(el("button", {class: "btn btn-sm", text: s, onclick: () => { word.value = s; run(); }}));
+      result.append(row);
+    }
+  };
+  word.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+  const d = el("details", {class: "tc-box"},
+    el("summary", {text: "Check a trigger word (optional)"}),
+    el("div", {class: "field-hint", text:
+      `Fizgig LoRA Isolation joins each subject's trigger word to what the subject is: "zwxem, a woman" trains as one ` +
+      `word, zwxemwoman. Some words join badly: the text encoder splits them so the subject word is no longer whole ` +
+      `(fyxo + woman reads as f | yx | ow | oman), and the LoRA learns that subject less cleanly. This checks a word ` +
+      `with ${name}'s text encoder, the one this LoRA trains with, before you caption.`}),
+    el("div", {class: "field-row"}, el("span", {class: "field-label", text: "Trigger word to check:"}), word),
+    el("div", {class: "field-row"}, el("span", {class: "field-label", text: "The subject is:"}), cls),
+    el("div", {class: "field-hint", text: "The word Fizgig joins on: the same trigger can join cleanly with one " +
+      "(dlor + woman) and break with another (dlor + man). A style or look is never joined, so only the word itself " +
+      "is checked."}),
+    el("div", {class: "field-row"}, el("span", {class: "field-label", text: "Other triggers:"}), others),
+    el("div", {class: "field-hint", text: "Optional: the trigger words of your other subjects in this same LoRA, separated by commas. Two " +
+      "subjects whose words start with the same letter, or share a piece, can blend into each other, so the check " +
+      "looks for that too. Leave it empty for a one-subject LoRA."}),
+    el("div", {class: "field-row"}, el("button", {class: "btn btn-primary", text: "Check", onclick: run})),
+    result);
+  d.open = S.tc.open;
+  d.addEventListener("toggle", () => { S.tc.open = d.open; });
+  return d;
+}
+
 function renderSections(tab, host) {
   host.innerHTML = "";
   for (const sec of S.fam.form.sections.filter((s) => s.tab === tab)) {
     const body = el("div", {class: "card-content" + (sec.collapsed ? " collapsed" : "")});
     const head = el("div", {class: "card-title collapsible-header", onclick: () => body.classList.toggle("collapsed")},
       el("span", {text: (sec.collapsed ? "▶ " : "▼ ") + sec.title}));
+    if (sec.help) {         // the card's video, a link across the top of the card
+      body.append(el("a", {class: "sec-video", href: sec.help.href, target: "_blank", rel: "noopener"},
+        el("span", {class: "sec-video-play", text: "▶"}),
+        el("span", {class: "sec-video-text"}, el("b", {text: sec.help.text}),
+          el("span", {class: "sec-video-sub", text: sec.help.sub || "Watch on YouTube"}))));
+    }
     for (const r of sec.rows) body.append(renderRow(r));
+    if (sec.id === "subjects" && !S.family.startsWith("acestep")) body.append(triggerCheckBlock());
     host.append(el("div", {class: "section-card", id: "sec-" + sec.id, "data-section": sec.id}, head, body));
   }
 }
@@ -166,23 +247,35 @@ function renderSections(tab, host) {
 function renderRow(r) {
   // its kind sets its layout (style.css): boxes in the grid, switches as tiles, a choice of pills, files and notes
   // across the card - from the schema's row kind, so every model's form lays out the same way
-  const kind = {check: "check", radio: "radio", note: "note", text: "wide", path: "wide", folder: "wide", shown: "wide"}[r.kind] || "field";
-  const wrap = el("div", {class: "form-row kind-" + kind, "data-key": r.key});
+  const kind = {check: "check", radio: "radio", note: "note", text: "wide", path: "wide", folder: "wide", shown: "wide",
+    cadence: "cadence", split: "cadence"}[r.kind] || "field";
+  const wrap = el("div", {class: "form-row kind-" + kind + (r.featured ? " row-featured" : "") +
+    (r.boxed ? " row-boxed" : ""), "data-key": r.key});
   if (r.kind === "shown") {                       // a value from elsewhere (the Start tab's folder), read-only here
-    wrap.append(el("div", {class: "field-row"}, el("span", {class: "field-label", text: r.label + ":"}),
-      el("input", {type: "text", class: "w-path", id: "note_" + r.key, readonly: true, tabindex: -1})));
+    const shownRow = el("div", {class: "field-row"}, el("span", {class: "field-label", text: r.label + ":"}),
+      el("input", {type: "text", class: "w-path", id: "note_" + r.key, readonly: true, tabindex: -1}));
+    if (r.sets_training_folder) {                 // the training folder itself (an edit's Edited folder, #217): choosing
+      shownRow.append(el("button", {class: "btn", text: "Choose…",          // it here sets the Start tab's
+        title: "Pick from what is on the machine running Fizgig - it becomes the training folder on the Start tab",
+        onclick: () => pick(S.imageFolder, true, (p) => {
+          $("imageFolder").value = p; $("imageFolder").dispatchEvent(new Event("change")); })}));
+    }
+    wrap.append(shownRow);
     if (r.hint) wrap.append(el("div", {class: "field-hint", text: r.hint}));
     return wrap;
   }
   if (r.kind === "note") {                        // its own text, and any the form's state writes (RefMod's tokens)
-    if (r.label) wrap.append(el("div", {class: "field-hint", text: r.label}));
-    wrap.append(el("div", {class: "field-hint row-note", id: "note_" + r.key}));
+    if (r.label) wrap.append(el("div", {class: r.hint_labels ? "field-label" : "field-hint", text: r.label}));
+    wrap.append(el("div", {class: "field-hint row-note" + (r.hint_labels ? " hint-lines note-lines" : ""),
+      id: "note_" + r.key}));
     return wrap;
   }
   const v = S.values[r.key];
   let input;
   const set = (val) => onValue(r, val);
   if (r.kind === "blocks") return blockPicker(r, wrap);
+  if (r.kind === "cadence") return cadenceRow(r, wrap);
+  if (r.kind === "split") return splitRow(r, wrap);
   if (r.kind === "check") {
     input = el("input", {type: "checkbox", id: "f_" + r.key, onchange: (e) => set(e.target.checked)});
     input.checked = !!v;
@@ -207,7 +300,7 @@ function renderRow(r) {
       for (const c of opts) input.append(el("option", {value: c, text: c}));
       input.value = String(val ?? "");
     } else if (r.kind === "text") {
-      input = el("textarea", {id: "f_" + r.key, rows: 4, oninput: (e) => set(e.target.value)});
+      input = el("textarea", {id: "f_" + r.key, rows: 4, spellcheck: "false", oninput: (e) => set(e.target.value)});
       input.value = v ?? "";
     } else if (r.kind === "combo") {
       // a dropdown of the usual values, as the desktop's, with Other… for a value of your own (a browser's
@@ -270,11 +363,150 @@ function renderRow(r) {
     if (upStatus) wrap.append(upStatus);
   }
   wrap.append(el("div", {class: "field-hint row-note", id: "note_" + r.key}));
-  if (r.hint) {                                   // a hint of several lines keeps its line breaks
+  const link = r.link ? el("a", {class: "inline-link", target: "_blank", rel: "noopener", href: r.link.href,
+    text: r.link.text + " →"}) : null;      // a row's guide on GitHub, under its hint
+  if (r.hint && r.hint_labels) {                  // one spaced line per choice, "Name: what it does" with the name bold
+    const h = el("div", {class: "field-hint hint-lines"});
+    for (const line of r.hint.split("\n")) {
+      const at = line.indexOf(": ");
+      h.append(at > 0 ? el("div", {}, el("b", {text: line.slice(0, at) + ": "}), line.slice(at + 2))
+                      : el("div", {text: line}));
+    }
+    wrap.append(h);
+  } else if (r.hint) {                            // a hint of several lines keeps its line breaks
     const h = el("div", {class: "field-hint", text: r.hint});
     if (r.hint.includes("\n")) h.style.whiteSpace = "pre-line";
     wrap.append(h);
   }
+  if (r.bold) wrap.append(el("div", {class: "field-hint"}, el("b", {text: r.bold})));   // a line the row stresses
+  if (link) wrap.append(el("div", {class: "field-hint"}, link));
+  if (r.warn) wrap.append(el("div", {class: "field-hint tc-warn"}, r.warn, r.warn_link ? el("a", {class: "inline-link",
+    target: "_blank", rel: "noopener", href: r.warn_link, text: " Best values: the Reddit discussion →"}) : ""));
+  return wrap;
+}
+
+// How often to preview: one sentence of boxes - "Every [N] epochs", then (ticked) "then from epoch [10], every
+// [1] epochs" - each box its own value, greyed one by one (refreshState reads data-field / data-part). Ticking it
+// fills in the row's tick_fills (every 5) while the first box is still at its default, and unticking puts that back
+function cadenceRow(r, wrap) {
+  const [later, until, after] = r.parts.map((p) => p.key);
+  const num = (key) => {
+    const i = el("input", {type: "text", inputmode: "numeric", class: "cad-num", id: "f_" + key, "data-field": key,
+      oninput: (e) => onValue({key}, e.target.value)});
+    i.value = S.values[key] ?? "";
+    return i;
+  };
+  const tick = el("input", {type: "checkbox", id: "f_" + later, "data-field": later, onchange: (e) => {
+    S._cadFilled = S._cadFilled || {};            // what the tick filled in, so unticking undoes only that
+    for (const [k, v] of Object.entries(r.tick_fills || {})) {
+      if (e.target.checked && String(S.values[k] ?? "") === String(r.default)) {
+        S.values[k] = v; S._cadFilled[k] = v; syncInputs([k]);
+      } else if (!e.target.checked && S._cadFilled[k] !== undefined && String(S.values[k]) === String(v)) {
+        S.values[k] = r.default; syncInputs([k]);
+      }
+      if (!e.target.checked) delete S._cadFilled[k];
+    }
+    onValue({key: later}, e.target.checked);
+  }});
+  tick.checked = !!S.values[later];
+  wrap.append(el("div", {class: "cad-title", text: r.label}),
+    el("div", {class: "cad-line"}, el("span", {text: "Every"}), num(r.key), el("span", {text: "epochs"})),
+    el("div", {class: "cad-line", "data-part": later},
+      el("label", {class: "cad-tick"}, tick, el("span", {text: "then from epoch"})),
+      el("span", {class: "cad-pair"}, num(until)),
+      el("span", {class: "cad-pair"}, el("span", {text: "every"}), num(after), el("span", {text: "epochs"}))),
+    el("div", {class: "field-hint row-note", id: "note_" + r.key}),
+    el("div", {class: "field-hint", "data-part": later, text: r.hint}));
+  return wrap;
+}
+
+// An entry with a Split mode (MOSS-Image's Clean-end share): Single is one value, Split a value for the first
+// epochs and another for the rest, Slide (when the row has one) a value held to an epoch, then easing down to another
+// by a later epoch. It stays one text - "30", "75:5:40" or "75:6:40:10" - so presets, Last Train and the queue carry
+// it as any entry; each mode remembers its own numbers while you switch between them
+function splitRow(r, wrap) {
+  // a row without Split shows a split value (75:5:40) as a Slide that drops at once (75:5:40:5)
+  const modeOf = () => { const n = String(S.values[r.key] ?? "").split(":").length;
+    return (n === 4 || n === 5) && r.slide ? "Slide" : n === 3 ? (r.split ? "Split" : "Slide") : "Single"; };
+  const partsOf = () => { const p = String(S.values[r.key] ?? "").split(":");
+    return p.length === 3 && !r.split ? [...p, p[1]] : p; };
+  S._split = S._split || {};
+  const m0 = modeOf();
+  const mem = S._split[r.key] = S._split[r.key] || {
+    single: m0 === "Single" ? String(S.values[r.key] ?? "") : String(r.single ?? (String(r.default ?? "").includes(":") ? "" : r.default ?? "")),
+    split: m0 === "Split" ? partsOf() : (r.split || []).slice(), slide: m0 === "Slide" ? partsOf() : (r.slide || []).slice()};
+  if (mem.slide.length === 5) { mem.every = mem.slide[4]; mem.slide = mem.slide.slice(0, 4); }   // the tick's number apart
+  const unit = (r.suffix || "").split(" ")[0];
+  const write = () => {
+    const m = modeOf();
+    if (m === "Split") { mem.split = [first, until, rest].map((i) => i.value.trim()); onValue(r, mem.split.join(":")); }
+    else if (m === "Slide") {          // the refresh tick adds its "every N" as a fifth number
+      mem.slide = [sFirst, sHold, sRest, sBy].map((i) => i.value.trim());
+      mem.every = sEvery.value.trim() || mem.every || "3";
+      sFirstEcho.textContent = sFirst.value;     // "one epoch at 75%" follows the first box
+      sEvery.disabled = !sTick.checked;
+      onValue(r, [...mem.slide, ...(sTick.checked ? [mem.every] : [])].join(":"));
+    }
+    else { mem.single = one.value.trim(); onValue(r, mem.single); }
+  };
+  const box = () => el("input", {type: "text", inputmode: "numeric", class: "cad-num", oninput: write});
+  const one = box(), first = box(), until = box(), rest = box();
+  const sFirst = box(), sHold = box(), sRest = box(), sBy = box(), sEvery = box();
+  const sTick = el("input", {type: "checkbox", onchange: write});
+  const sFirstEcho = el("span");                   // "one epoch at 75%": the first share, as typed
+  const pills = el("div", {class: "radio-row"});
+  for (const c of ["Single", ...(r.split ? ["Split"] : []), ...(r.slide ? ["Slide"] : [])]) {
+    pills.append(el("label", {class: "checkbox-label"}, el("input", {type: "radio", name: "split_" + r.key, value: c,
+      onchange: () => { onValue(r, c === "Split" ? mem.split.join(":") : c === "Slide" ? [...mem.slide,
+          ...(mem.every && mem.slideTick !== false ? [mem.every] : [])].join(":") : mem.single);
+        show(); }}), " " + c));
+  }
+  const lineOne = el("div", {class: "cad-line"}, one, el("span", {text: r.suffix || ""}));
+  const lineSplit = el("div", {class: "cad-line"},
+    el("span", {class: "cad-pair"}, first, el("span", {text: unit + " for the first"})),
+    el("span", {class: "cad-pair"}, until, el("span", {text: "epochs, then"})),
+    el("span", {class: "cad-pair"}, rest, el("span", {text: unit})));
+  const lineSlide = el("div", {class: "cad-line"},
+    el("span", {class: "cad-pair"}, sFirst, el("span", {text: unit + " until epoch"})),
+    el("span", {class: "cad-pair"}, sHold, el("span", {text: "then down to"})),
+    el("span", {class: "cad-pair"}, sRest, el("span", {text: unit + " by epoch"})),
+    el("span", {class: "cad-pair"}, sBy));
+  const lineRefresh = (r.slide || []).length > 4 ? el("div", {class: "cad-line"},
+    el("label", {class: "cad-tick"}, sTick, el("span", {text: "then every"})),
+    el("span", {class: "cad-pair"}, sEvery, el("span", {}, "epochs, one epoch at ", sFirstEcho, unit))) : null;
+  const hintOne = el("div", {class: "field-hint", text: r.hint});
+  const hintSplit = el("div", {class: "field-hint", text: r.split_hint || r.hint});
+  const hintSlide = el("div", {class: "field-hint", text: r.slide_hint || r.hint});
+  function show() {
+    const m = modeOf();
+    pills.querySelectorAll("input").forEach((rb) => { rb.checked = rb.value === m; });
+    if (m === "Split") { mem.split = partsOf(); [first.value, until.value, rest.value] = mem.split; }
+    else if (m === "Slide") {
+      const p = partsOf();
+      mem.slide = p.slice(0, 4); [sFirst.value, sHold.value, sRest.value, sBy.value] = mem.slide;
+      sTick.checked = p.length === 5;
+      if (p.length === 5) mem.every = p[4];
+      sEvery.value = mem.every || (r.slide || [])[4] || "3";
+      sEvery.disabled = !sTick.checked;
+      sFirstEcho.textContent = sFirst.value;
+    }
+    else { one.value = S.values[r.key] ?? ""; mem.single = one.value; }
+    for (const [node, on] of [[lineOne, m === "Single"], [hintOne, m === "Single"], [lineSplit, m === "Split"],
+                              [hintSplit, m === "Split"], [lineSlide, m === "Slide"], [lineRefresh, m === "Slide"],
+                              [hintSlide, m === "Slide"]]) {
+      if (node) node.style.display = on ? "" : "none";
+    }
+  }
+  const sync = el("input", {type: "hidden", id: "f_" + r.key});    // syncInputs (a preset, Last Train) redraws it
+  sync._sync = show;
+  sTick.addEventListener("change", () => { mem.slideTick = sTick.checked; });
+  wrap.append(el("div", {class: "cad-title", text: r.label}), pills, lineOne, lineSplit, lineSlide, ...(lineRefresh ? [lineRefresh] : []),
+    hintOne, hintSplit,
+    hintSlide, sync,
+    el("div", {class: "field-hint row-note", id: "note_" + r.key}));
+  if (r.warn) wrap.append(el("div", {class: "field-hint tc-warn"}, r.warn, r.warn_link ? el("a", {class: "inline-link",
+    target: "_blank", rel: "noopener", href: r.warn_link, text: " Best values: the Reddit discussion →"}) : ""));
+  show();
   return wrap;
 }
 
@@ -307,7 +539,9 @@ function blockPicker(r, wrap) {
 function onValue(r, val) {
   S.values[r.key] = val;
   if (r.key === "__SAMPLE_LIVE" || (S.values.__SAMPLE_LIVE &&
-      ["SAMPLE_PROMPT", "SAMPLE_SEED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT"].includes(r.key))) sampleLiveSoon();
+      ["SAMPLE_PROMPT", "SAMPLE_SEED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS", "SAMPLE_CFG_SCALE",
+       "FAMILY_TURBO_STRENGTH", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_LATER", "SAMPLE_UNTIL_EPOCH",
+       "SAMPLE_EVERY_AFTER", "FAMILY_PREVIEW_LOOK"].includes(r.key))) sampleLiveSoon();
   if (r.key === "CAPTION_TRIGGER_WORD") { S.trigger = String(val).trim(); $("capTrigger").value = S.trigger; saveTriggerSoon(S.trigger); }
   const extra = r.sets && r.sets[val];            // a kind of training that also sets others (Fine-tune's LR)
   if (extra) { Object.assign(S.values, extra); syncInputs(Object.keys(extra)); }
@@ -332,21 +566,31 @@ function fillCombo(sel, choices, v, labels) {
 function syncInputs(keys) {
   for (const k of keys) {
     const i = $("f_" + k);
-    if (!i) continue;
+    if (!i) {                                     // a choice of pills: its radio inputs share the name
+      document.querySelectorAll(`input[type="radio"][name="f_${k}"]`).forEach((rb) => {
+        rb.checked = rb.value === String(S.values[k] ?? ""); });
+      continue;
+    }
     if (i.tagName === "SELECT" && [...i.options].some((o) => o.value === "__other")) {
       const row = (S.fam.form.sections.flatMap((s) => s.rows).find((r) => r && r.key === k)) || {choices: []};
       fillCombo(i, row.choices, S.values[k], row.labels);
       continue;
     }
+    if (i._sync) { i._sync(); continue; }         // a control that draws itself from the value (splitRow)
     if (i.type === "checkbox") i.checked = !!S.values[k]; else i.value = S.values[k] ?? "";
   }
 }
 
 async function refreshState() {
   S.state = await api("/api/form/state", {family: S.family, values: S.values, image_folder: S.imageFolder});
+  if (S.state.poll) setTimeout(refreshStateSoon, 2000);     // a download under way: its note moves on
   const force = Object.keys(S.state.force || {});      // what a setting turns off (automagic3: Adaptive LR...)
   if (force.length) { Object.assign(S.values, S.state.force); syncInputs(force); saveStateSoon(); }
   const hidden = new Set(S.state.hidden), disabled = new Set(S.state.disabled);
+  for (const [k, ph] of Object.entries(S.state.placeholders || {})) {   // what Fizgig found, greyed in the box
+    const box = $("f_" + k);
+    if (box) box.placeholder = ph;
+  }
   document.querySelectorAll(".form-row[data-key]").forEach((row) => {
     const k = row.dataset.key;
     row.style.display = hidden.has(k) ? "none" : "";
@@ -354,15 +598,36 @@ async function refreshState() {
     const lab = row.querySelector(".field-label"), rowDef = (S.fam.form.sections.flatMap((s) => s.rows)
       .find((r) => r && r.key === k));
     if (lab && rowDef) lab.textContent = ((S.state.labels || {})[k] || rowDef.label) + ":";
-    row.querySelectorAll("input,select,textarea,button").forEach((i) => { i.disabled = disabled.has(k); });
+    // a control of several values greys and hides each of its parts by its own key
+    row.querySelectorAll("input,select,textarea,button").forEach((i) => { i.disabled = disabled.has(i.dataset.field || k); });
+    row.querySelectorAll("[data-part]").forEach((p) => { p.style.display = hidden.has(p.dataset.part) ? "none" : ""; });
+    // single choices greyed in a row of pills (Fizgig LoRA Isolation with one subject)
+    const off = ((S.state.disabled_choices || {})[k]) || {};       // {choice: why}, the why on hover
+    row.querySelectorAll(`input[type="radio"][name="f_${k}"]`).forEach((rb) => {
+      if (rb.value in off) rb.disabled = true;
+      const lab = rb.closest("label");
+      lab.classList.toggle("choice-off", rb.disabled);
+      lab.title = off[rb.value] || "";
+    });
     // a greyed box shows what that run will really use (the Distilled's steps / CFG), the form's own value kept
     const shown = (S.state.shown || {})[k], box = $("f_" + k);
     if (box && shown !== undefined && disabled.has(k)) { box.value = shown; box.dataset.shown = "1"; }
     else if (box && box.dataset.shown) { delete box.dataset.shown; syncInputs([k]); }
     const n = $("note_" + k);
+    if (n && k === "__SAMPLE_LIVE") {          // its note follows the run (liveNote), not the form's state
+      S._liveNoteFor = undefined;
+      liveNote(!!(S.run && (S.run.running || S.run.state === "starting")));
+      return;
+    }
     if (n) {
       if (n.tagName === "INPUT") { n.value = S.state.notes[k] || ""; return; }
-      n.textContent = S.state.notes[k] || "";
+      if (n.classList.contains("note-lines")) {    // one line each, "Label: text" with the label bold (Subjects card)
+        n.replaceChildren(...String(S.state.notes[k] || "").split("\n").filter(Boolean).map((line) => {
+          const at = line.indexOf(": ");
+          return at > 0 ? el("div", {}, el("b", {text: line.slice(0, at) + ": "}), line.slice(at + 2))
+                        : el("div", {text: line});
+        }));
+      } else n.textContent = S.state.notes[k] || "";
       const act = (S.state.actions || {})[k];      // a hint's one-click change (the desktop's: Use 1e-4)
       if (act) n.append(" ", el("button", {class: "btn btn-sm", text: act.label, onclick: () => {
         Object.assign(S.values, act.values); syncInputs(Object.keys(act.values)); refreshStateSoon(); saveStateSoon(); }}));
@@ -376,33 +641,60 @@ async function refreshState() {
 }
 
 // Steps and CFG follow the Turbo LoRA, as the desktop's Samples tab: its own (Qwen: 8 steps, CFG 1) while it renders -
-// file set in Preferences AND strength above 0 - else the plain model's (Qwen: 25, CFG 3). They switch on a first visit
-// or when the turbo turned on or off since last seen (the file set, or the strength moved across 0), and only a box
-// still on the other side's default, so a value you typed is never replaced.
+// file set in Preferences AND strength above 0 - else the plain model's (Qwen: 25, CFG 3). Only an empty box or one on
+// another of these defaults switches, so a value you typed is never replaced.
 // A preview-checkpoint tick (Klein's / Flux 3's distilled) does the same with its row's follow: ticked with the file
 // set, Steps shows the distilled's own count (Flux 3: 16), unticked the Base's (50).
+// A model with both (Qwen Image 2.1, MOSS-Image) gets one answer for the boxes they share: a ticked preview checkpoint's
+// own values, else a live Turbo's, else the plain model's. Each used to switch the boxes on its own, so an unticked
+// checkpoint put the plain model's 25 steps, CFG 3 back under a live Turbo LoRA (noisy previews). A box still on any
+// of the defaults is put right when the form loads, which also mends a form saved in that state; after that the boxes
+// move only when a switch changes, so steps typed by hand stay (they used to snap back to the mode's default).
 function turboFollow() {
-  for (const s of S.fam.form.sections) for (const row of s.rows) {
-    if (!row || !(row.turbo || row.follow)) continue;
-    let live, flag, sides;
-    if (row.turbo) {
+  const rows = [];
+  for (const s of S.fam.form.sections) for (const row of s.rows) if (row && (row.turbo || row.follow)) rows.push(row);
+  if (!rows.length) return;
+  const want = {}, known = {}, flags = {};
+  const note = (side) => { for (const [k, v] of Object.entries(side)) (known[k] = known[k] || []).push(parseFloat(v)); };
+  for (const row of rows) {
+    const sides = row.turbo || row.follow;
+    note(sides.on); note(sides.off);
+    Object.assign(want, sides.off);
+  }
+  // the later pass wins the boxes they share: normally the preview checkpoint's own values, but a checkpoint that
+  // takes the Turbo LoRA (Kromoss) renders a live Turbo's steps and CFG
+  const order = S.state && S.state.checkpoint_turbo ? ["follow", "turbo"] : ["turbo", "follow"];
+  for (const pass of order) for (const row of rows) {
+    if (!row[pass]) continue;
+    let live;
+    if (pass === "turbo") {
       const raw = S.values.FAMILY_TURBO_STRENGTH;
       const strength = parseFloat(raw === undefined || raw === "" ? row.default : raw);
-      live = !!S.state.turbo_file && strength > 0; flag = "__turbo_live"; sides = row.turbo;
+      live = !!S.state.turbo_file && strength > 0; flags.__turbo_live = live;
     } else {
       const v = S.values[row.key];
-      live = !!S.state.checkpoint_file && !!(v === undefined ? row.default : v);
-      flag = "__follow_" + row.key; sides = row.follow;
+      live = !!S.state.checkpoint_file && !!(v === undefined ? row.default : v); flags["__follow_" + row.key] = live;
     }
-    if (S.values[flag] === live) continue;
-    const want = live ? sides.on : sides.off, other = live ? sides.off : sides.on;
-    const moved = Object.keys(want).filter((k) => S.values[k] === undefined || S.values[k] === "" ||
-      parseFloat(S.values[k]) === parseFloat(other[k]));        // "3.0" is the default 3
-    for (const k of moved) S.values[k] = want[k];
-    S.values[flag] = live;
-    syncInputs(moved);
-    saveStateSoon();
+    if (live) Object.assign(want, row[pass].on);
   }
+  const moved = Object.keys(want).filter((k) => {
+    const v = S.values[k];
+    if (v === undefined || v === "") return true;
+    return parseFloat(v) !== parseFloat(want[k]) && known[k].includes(parseFloat(v));   // "3.0" is the default 3
+  });
+  const flagsChanged = Object.entries(flags).some(([f, live]) => S.values[f] !== live);
+  const loading = S._turboFollowFor !== S.fam;       // the first pass for this model's form
+  S._turboFollowFor = S.fam;
+  if (!flagsChanged && !loading) return;
+  if (!moved.length && !flagsChanged) return;
+  for (const k of moved) S.values[k] = want[k];
+  Object.assign(S.values, flags);
+  syncInputs(moved);
+  saveStateSoon();
+  if (S.values.__SAMPLE_LIVE && moved.length) sampleLiveSoon();
+  // what hangs on the moved values (the negative box shows only above CFG 1) is worked out again from them; the next
+  // pass finds nothing to move, so this settles after one round
+  if (moved.length) refreshStateSoon();
 }
 const refreshStateSoon = debounce(refreshState, 250);
 
@@ -570,15 +862,25 @@ function fetchRow(f) {
   const box = el("div", {class: "fetch-row"});
   const opt = f.fetch_optional_label ? el("input", {type: "checkbox"}) : null;
   const token = gated.length ? el("input", {type: "password", class: "w-path", placeholder: "hf_…"}) : null;
+  // a file offered with another build (MOSS-Image Base or Kromoss): a pick, starting on the one its path holds now
+  const picks = files.filter((m) => m.fetch_choice && m.fetch_choice.length === 2 && m.alt_repo && m.alt_path).map((m) => {
+    const sel = el("select", {}, el("option", {value: "main", text: m.fetch_choice[0]}),
+      el("option", {value: "alt", text: m.fetch_choice[1]}));
+    const cur = String(S.prefs[m.pref_key] || "").split(/[\\/]/).pop();
+    sel.value = cur && cur === m.alt_path.split("/").pop() ? "alt" : "main";
+    return {key: m.pref_key, sel, label: m.label};
+  });
   const btn = el("button", {class: "btn btn-accent", text: "⬇ Download models for me", onclick: async () => {
     try {
-      await api("/api/fetch", {family: f.key, token: token ? token.value.trim() : "", optional: opt ? opt.checked : false});
+      await api("/api/fetch", {family: f.key, token: token ? token.value.trim() : "", optional: opt ? opt.checked : false,
+        choices: Object.fromEntries(picks.map((p) => [p.key, p.sel.value]))});
       if (token) token.value = "";
       S.fetchError = null;
       watchFetch();
     } catch (e) { S.fetchError = {family: f.key, text: e.message}; paintFetch(); }
   }});
   const line = el("div", {class: "field-row"}, btn);
+  for (const p of picks) line.append(el("label", {class: "fetch-opt"}, p.label + ": ", p.sel));
   if (opt) line.append(el("label", {class: "fetch-opt"}, opt, " " + f.fetch_optional_label));
   box.append(line);
   if (token) {
@@ -671,6 +973,8 @@ function gpuPickCard() {
 // where uploads go: Preferences' training data folder (the desktop's Input Directories > Training images), else
 // training_data inside Fizgig
 function showUploadRoot() {
+  // on the machine running Fizgig, Choose… picks the folder itself: uploading would only copy it
+  $("uploadCard").style.display = pageIsElsewhere() ? "" : "none";
   api("/api/upload/root").then((d) => {
     S.uploadRoot = d;
     if (!S.onPod) $("imageFolder").placeholder = d.root + (d.root.includes("\\") ? "\\" : "/") + "my_subject";
@@ -741,6 +1045,29 @@ function podCard() {
   const saveKey = async (v) => { await api("/api/prefs", {changes: {runpod_api_key: v}}); P.key_saved = !!v; key.value = ""; sayKey(); };
   key.addEventListener("change", () => key.value.trim() && saveKey(key.value.trim()));
   sayKey();
+  const vast = P.provider === "vast";
+  const midRun = el("div", {class: "field-hint warn", text: "Stopping the " + (vast ? "instance" : "pod") +
+    " yourself while a run trains loses what it trained since its last save: press Pause first (it saves and stops " +
+    "at the end of the epoch), then stop it."});
+  if (vast) return el("div", {class: "section-card"},
+    el("div", {class: "card-title"}, el("span", {text: "Vast.ai"})),
+    el("div", {class: "card-desc", text: "Fizgig is running on a rented GPU (a Vast.ai instance). These settings only appear here."}),
+    el("div", {class: "card-content"},
+      P.https ? el("div", {class: "field-hint"}, "Its https address (new each time the instance starts): ",
+        el("a", {href: P.https, target: "_blank", rel: "noopener", text: P.https}),
+        location.protocol === "http:" ? " - use it rather than this plain http one: your password and login travel " +
+        "encrypted there." : "") : null,
+      el("label", {class: "checkbox-label"}, on, " Stop this instance when a training run finishes"),
+      el("div", {class: "field-hint", text: "Only after a run completes on its own - never after a pause, a stop or a " +
+        "failure, and with a queue only after its last run. A two-minute countdown you can cancel comes first, on any " +
+        "page. It stops the GPU billing; the instance's disk still bills until you destroy it on Vast's site, so bring " +
+        "your LoRAs home and destroy it when you're done. No key needed: the instance stops itself."}),
+      midRun,
+      P.storage ? el("div", {class: "field-hint" + (P.storage[1] ? " warn" : ""), text: P.storage[0]}) : null,
+      el("div", {class: "field-hint prefs-note", text: "Your files: datasets in /workspace/datasets, models in " +
+        "/workspace/models, finished LoRAs in /workspace/output_loras. They survive stopping and starting the " +
+        "instance, and go when you destroy it. A stopped instance may not start again while someone else rents its GPU."}),
+      el("div", {class: "field-hint", text: "Closing this browser tab doesn't stop training: Fizgig runs on the instance, not in your browser."})));
   return el("div", {class: "section-card"},
     el("div", {class: "card-title"}, el("span", {text: "RunPod"})),
     el("div", {class: "card-desc", text: "Fizgig is running on a rented GPU" + (P.pod_id ? ` (pod ${P.pod_id})` : "") + ". These settings only appear here."}),
@@ -749,6 +1076,7 @@ function podCard() {
       el("div", {class: "field-hint", text: "Only after a run completes on its own - never after a pause, a stop or a failure, " +
         "and with a queue only after its last run. A two-minute countdown you can cancel comes first, on any page. It stops " +
         "the pod, never terminates it, so your files are still here when you start it again."}),
+      midRun,
       el("div", {class: "field-row"}, el("span", {class: "field-label", text: "RunPod API key:"}), key,
         el("button", {class: "btn btn-sm", text: "Clear", onclick: () => saveKey("")}), keySay),
       el("div", {class: "field-hint", text: "Make one at RunPod > Settings > API Keys. The key RunPod gives a pod by itself " +
@@ -953,9 +1281,9 @@ async function check() {
   } catch (e) { showProblems([e.message]); }
 }
 
-async function start(path) {
+async function start(path, body) {
   try {
-    const r = await api(path, path === "/api/start" ? runBody() : {});
+    const r = await api(path, path === "/api/start" ? runBody() : (body || {}));
     showProblems(r.problems || (r.error ? [r.error] : []));    // stays up: the run line below refreshes itself
     pollRun();
   } catch (e) { showProblems([e.message]); }
@@ -967,13 +1295,22 @@ async function start(path) {
 const SIZE_KEYS = {DATASET_MEGAPIXELS: "Target Megapixels", CLIP_MEGAPIXELS: "Clip Megapixels"};
 async function resumeClick() {
   const r = S.run || {}, was = r.values || {}, box = $("resumeChoice");
+  // the previews as the Samples tab has them now (prompts, seed, size, steps, CFG, Turbo strength, the preview
+  // checkpoint tick), block swap, the save schedule and the learning rate go with the resume
+  const samples = r.family === S.family ? Object.fromEntries(["SAMPLE_PROMPT", "SAMPLE_SEED", "SAMPLE_WIDTH",
+    "SAMPLE_HEIGHT", "SAMPLE_STEPS", "SAMPLE_CFG_SCALE", "FAMILY_TURBO_STRENGTH", "SAMPLE_CHECKPOINT", "BLOCKS_SWAP",
+    "FAMILY_PREVIEW_LOOK",
+    "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_LATER", "SAMPLE_UNTIL_EPOCH", "SAMPLE_EVERY_AFTER",
+    "SAVE_EVERY_N_EPOCHS", "SAVE_LATER", "SAVE_UNTIL_EPOCH", "SAVE_EVERY_AFTER",
+    "LEARNING_RATE", "ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX"]
+    .filter((k) => k in S.values).map((k) => [k, S.values[k]])) : {};
   const diff = r.family === S.family ? Object.keys(SIZE_KEYS).filter((k) => S.values[k] !== undefined &&
     String(S.values[k]).trim() !== "" && Number(S.values[k]) !== Number(was[k])) : [];
-  if (!diff.length) { box.style.display = "none"; return start("/api/resume"); }
+  if (!diff.length) { box.style.display = "none"; return start("/api/resume", {samples}); }
   const say = diff.map((k) => `${SIZE_KEYS[k]} ${was[k] || "?"} → ${S.values[k]}`).join(", ");
   const go = (body) => async () => {
     box.style.display = "none";
-    try { const x = await api("/api/resume", body); showProblems(x.problems || (x.error ? [x.error] : [])); }
+    try { const x = await api("/api/resume", {...body, samples}); showProblems(x.problems || (x.error ? [x.error] : [])); }
     catch (e) { showProblems([e.message]); }
     pollRun();
   };
@@ -997,6 +1334,7 @@ async function pollRun() {
   $("podStopKeep").textContent = ps.counting ? "Keep the pod running" : "OK";      // a result note: dismissed
   $("podStopText").textContent = ps.counting ? `Stopping this pod in ${ps.left} s so it stops billing.` : ps.note || "";
   const r = S.run, live = r.running || r.state === "starting";
+  liveNote(live);
   const label = RUN_LABELS[r.state] || r.state;
   $("runStatus").textContent = r.lora ? `${label}: ${r.lora}${r.stage ? " · " + r.stage : ""}` : label;
   $("runBadge").textContent = label;
@@ -1014,6 +1352,10 @@ async function pollRun() {
   renderWebQueue(r.web_queue || {items: []});
   queueSummary(r.web_queue || {items: []}, r);
   runLossTick(live);
+  // Per-image loss on the run card while a run with the per-image loss tick trains (Runs & outputs has it after)
+  const ilOn = live && r.history_id && (r.values || {}).KREA2_LOSS_WATCH;
+  $("btnImageLoss").style.display = ilOn ? "" : "none";
+  if (!ilOn) $("runImageLoss").style.display = "none";
   // Sample now / Save now: while a LoRA trains (a fine-tune saves and previews at whole rotations)
   const runDesc = S.schema.families.find((f) => f.key === r.family);
   const ftRun = r.values && r.values.FAMILY_KIND && /fine-tune/i.test(String(r.values.FAMILY_KIND));
@@ -1064,9 +1406,12 @@ function queueSummary(q, r) {
   const items = q.items || [], n = items.length;
   const side = $("sideQueue"), up = $("runUpNext");
   side.style.display = up.style.display = n ? "" : "none";
-  if (!n) return;
+  if (!n) { S.queueSumSig = null; return; }
   const text = q.held ? `Queue held: ${q.reason || "press Start queue to carry on"}` :
     q.waiting ? `Queue waiting: ${q.waiting}` : "";
+  const sig = JSON.stringify([text, q.held, q.reason, q.waiting, items.map((it) => [it.id, it.lora])]);
+  if (sig === S.queueSumSig) return;              // as renderWebQueue: a rebuild mid-click drops Start queue's click
+  S.queueSumSig = sig;
   side.classList.toggle("held", !!q.held);
   const badge = $("sideQueueBadge");
   badge.textContent = q.held ? "Held" : q.waiting ? "Waiting" : `${n} queued`;
@@ -1097,6 +1442,11 @@ function renderWebQueue(q) {
   $("webQueueHold").style.display = q.held || !items.length ? "none" : "";
   $("webQueueClear").style.display = items.length ? "" : "none";
   S.queueIds = items.map((it) => it.id);
+  // rebuilt only when the queue changes: rebuilding on every poll replaced a button between press and release, and
+  // the browser dropped that click (Remove sometimes did nothing)
+  const sig = JSON.stringify(items.map((it) => [it.id, it.lora, it.family, it.image_folder, it.queued_at]));
+  if (sig === S.queueSig) return;
+  S.queueSig = sig;
   const famName = (k) => ((S.schema.families.find((f) => f.key === k) || {}).display_name) || k;
   const host = $("webQueueList");
   host.innerHTML = "";
@@ -1125,19 +1475,29 @@ function renderWebQueue(q) {
 function followLog() {
   const src = S.logSrc = new EventSource(`/api/log?since=${S.logSince}&t=${encodeURIComponent(TOKEN)}`);
   const out = $("console");
+  // the console as finished lines (body) and the line still being written (tail: a progress bar's latest state),
+  // drawn at most every 50 ms. A new tab replays the run's backlog (up to 5000 lines) at once, and rewriting the
+  // whole console and laying it out again for every line froze the page on a long run
+  const t0 = out.textContent, nl = t0.lastIndexOf("\n");
+  let body = t0.slice(0, nl + 1), tail = t0.slice(nl + 1), done = [], queued = false;
+  const flush = () => {
+    queued = false;
+    const atEnd = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
+    if (done.length) { body = (body + done.join("")).slice(-200000); done = []; }
+    out.textContent = body + tail;
+    if (atEnd) out.scrollTop = out.scrollHeight;
+  };
   src.onmessage = (e) => {
     S.logSince = Number(e.lastEventId) || S.logSince;
     const line = JSON.parse(e.data);
-    if (line === "\u0000clear\n") { out.textContent = ""; return; }   // a new run: its own log from here
-    const atEnd = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
-    // a progress bar redraws itself with \r: keep only its latest state
-    const text = out.textContent;
-    if (line.includes("\r") && !line.endsWith("\n")) {
-      out.textContent = text.slice(0, text.lastIndexOf("\n") + 1) + line.split("\r").pop();
-    } else {
-      out.textContent = (text + line.split("\r").pop()).slice(-200000);
+    if (line === "\u0000clear\n") { body = tail = ""; done = []; }   // a new run: its own log from here
+    else if (line.includes("\r") && !line.endsWith("\n")) tail = line.split("\r").pop();   // a progress bar redraws
+    else {
+      const all = tail + line.split("\r").pop(), cut = all.lastIndexOf("\n") + 1;
+      if (cut) done.push(all.slice(0, cut));
+      tail = all.slice(cut);
     }
-    if (atEnd) out.scrollTop = out.scrollHeight;
+    if (!queued) { queued = true; setTimeout(flush, 50); }
   };
   src.onerror = () => { src.close(); if (S.logSrc === src) setTimeout(followLog, 3000); };
 }
@@ -1194,11 +1554,19 @@ function previewLabel(it) {
   return [`Epoch ${it.epoch}`, `Prompt ${it.idx + 1}`, it.strength != null && `strength ${it.strength}`]
     .filter(Boolean).join(" · ");
 }
-function previewFigure(it, prompts, eager) {
-  const prompt = it.idx != null && prompts ? prompts[it.idx] : "";
-  return el("figure", {class: "gallery-item", title: it.name}, mediaFor(it, eager && eager.has(it)),
+function previewFigure(it, prompts, eager, byEpoch) {
+  // its own epoch's prompt (recorded by the trainer, so a mid-run change shows), else the run's
+  const own = byEpoch && it.epoch != null && byEpoch[String(it.epoch)];
+  const prompt = it.idx == null ? "" : (own && own[it.idx]) || (prompts ? prompts[it.idx] : "");
+  return withMode(el("figure", {class: "gallery-item", title: it.name}, mediaFor(it, eager && eager.has(it)),
     el("figcaption", {}, el("b", {text: previewLabel(it)}), prompt ? el("span", {class: "preview-prompt", text: prompt}) : null,
-      el("span", {class: "preview-file", text: it.name})));
+      el("span", {class: "preview-file", text: it.name}))), it);
+}
+// the family's line on how this preview was made (the run's record), shown over it in the lightbox
+function withMode(fig, it) {
+  const L = S.galleryLabels;
+  if (L && it.epoch != null && (!it.run || it.run === L.run)) fig._mode = L.labels[String(it.epoch)] || "";
+  return fig;
 }
 
 // prompts as rows, epochs as columns (full-strength pictures; a slider's strip is its own picture)
@@ -1214,9 +1582,9 @@ function previewGrid(items, prompts, eager) {
       el("th", {class: "prompt-head"}, el("b", {text: `Prompt ${i + 1}`}),
         prompts[i] ? el("span", {class: "preview-prompt", text: prompts[i]}) : null),
       ...epochs.map((e) => { const it = at.get(e + ":" + i);
-        return el("td", {}, it ? el("figure", {class: "gallery-item", title: it.name}, mediaFor(it, eager && eager.has(it)),
+        return el("td", {}, it ? withMode(el("figure", {class: "gallery-item", title: it.name}, mediaFor(it, eager && eager.has(it)),
           el("figcaption", {class: "visually-hidden"}, el("b", {text: previewLabel(it)}),
-            prompts[i] ? el("span", {text: " · " + prompts[i]}) : null)) : null); })));
+            prompts[i] ? el("span", {text: " · " + prompts[i]}) : null)), it) : null); })));
   }
   return el("div", {class: "gallery prompt-grid-wrap"}, table);
 }
@@ -1236,6 +1604,8 @@ async function loadGallery() {
   let g = await get(want);
   let run = want;
   if (!g.items.length && g.runs.length && !g.runs.includes(want)) { run = g.runs[0]; g = await get(run); }
+  previewMode(g.preview_mode);
+  S.galleryLabels = {run, labels: g.preview_labels || {}};        // the lightbox's line per epoch (previewFigure)
   const sel = $("galleryRun");
   sel.innerHTML = "";
   // "this run" while it trains; once it has ended it is the last run
@@ -1257,7 +1627,7 @@ async function loadGallery() {
   const top = epochs.length ? Math.max(...epochs) : null;
   const eager = new Set((top != null ? g.items.filter((it) => it.epoch === top) : g.items.slice(0, 3)).slice(0, 8));
   if (view === "grid" && g.items.length) host.append(previewGrid(g.items, g.prompts || [], eager));
-  else for (const it of g.items.slice(0, 120)) host.append(previewFigure(it, g.prompts || [], eager));
+  else for (const it of g.items.slice(0, 120)) host.append(previewFigure(it, g.prompts || [], eager, g.epoch_prompts));
   S.gal = {items: g.items, run, sig};
   likenessShow(dir, g.items, run, view);
   const others = g.runs.filter((r) => r !== run).length;
@@ -1296,7 +1666,8 @@ async function likenessShow(dir, items, run, view) {
     const it = pics.find((p) => p.name === fig.title);
     if (!on || !it) continue;
     const s = d.scores[it.name];
-    const cls = s === undefined || s === null ? "na" : s >= 0.45 ? "good" : s >= 0.30 ? "mid" : "bad";
+    const t = d.thresholds || {match: 0.45, borderline: 0.30};     // the embedder's own bands (ArcFace / DINOv2 / CLIP)
+    const cls = s === undefined || s === null ? "na" : s >= t.match ? "good" : s >= t.borderline ? "mid" : "bad";
     fig.append(el("span", {class: `lik-badge ${cls}${it.epoch === bestEpoch && bestEpoch != null ? " best" : ""}`,
       text: s === undefined ? "…" : s === null ? "no face" : `${Math.round(s * 100)}%`}));
   }
@@ -1308,11 +1679,12 @@ async function likenessShow(dir, items, run, view) {
   if (cv.width !== w) cv.width = w;
   const g = cv.getContext("2d"), W = cv.width, H = cv.height, L = 42, R = 12, T = 12, B = 22;
   g.clearRect(0, 0, W, H);
-  const ymax = Math.max(0.7, Math.max(...avgs) + 0.05);
+  const ymax = Math.min(1, Math.max(0.7, (d.thresholds || {}).match + 0.15 || 0, Math.max(...avgs) + 0.05));
   const x = (i) => epochs.length === 1 ? L + (W - L - R) / 2 : L + (W - L - R) * i / (epochs.length - 1);
   const y = (v) => T + (H - T - B) * (1 - v / ymax);
   g.font = "11px sans-serif"; g.lineWidth = 1;
-  for (const band of [0.30, 0.45]) {         // the badge colour bands, for orientation
+  const bands = d.thresholds || {match: 0.45, borderline: 0.30};
+  for (const band of [bands.borderline, bands.match]) {         // the badge colour bands, for orientation
     g.strokeStyle = "#34495E"; g.fillStyle = "#7F8C8D";
     g.beginPath(); g.moveTo(L, y(band)); g.lineTo(W - R, y(band)); g.stroke();
     g.fillText(Math.round(band * 100) + "%", 8, y(band) + 4);
@@ -1335,7 +1707,7 @@ async function likenessPicker() {
   grid.innerHTML = "";
   $("likModal").classList.add("active");
   if (!folder) return;
-  const r = await api(`/api/captions?folder=${encodeURIComponent(folder)}&ext=${encodeURIComponent(capExt())}`).catch(() => ({items: []}));
+  const r = await api(`/api/captions?folder=${encodeURIComponent(folder)}&ext=${encodeURIComponent(capExt())}&family=${encodeURIComponent(S.family || "")}`).catch(() => ({items: []}));
   for (const it of r.items.filter((x) => LIK_PICS.test(x.name))) {
     const fig = el("figure", {title: it.name, onclick: () => {
       const i = S.lik.picked.indexOf(it.name);
@@ -1511,18 +1883,52 @@ async function loadCheckpoints() {
       onclick: (e) => { e.preventDefault(); S.ckptAll = !S.ckptAll; loadCheckpoints(); }}) : document.createTextNode(""));
 }
 
+// the Previews so far card: what this run's previews render with (recorded by the trainer when the run started)
+function previewMode(m) {
+  const box = $("galleryMode");
+  if (!box) return;
+  box.className = "preview-mode" + (m && m.turbo ? " turbo" : "");
+  if (!m) { box.style.display = "none"; return; }
+  const how = `${m.steps} steps, CFG ${Number(m.cfg).toFixed(1).replace(/\.0$/, "")}`;
+  box.textContent = m.turbo
+    ? `⚡ Turbo LoRA in use: ${m.turbo} at strength ${m.strength}, ${how}. ${m.turbo_note ? m.turbo_note + " " : ""}` +
+      "For full-quality previews, set Turbo " +
+      "LoRA strength to 0 above (Steps and CFG go back with it); tick Change the previews of the run going now " +
+      "for it to apply from this run's next preview."
+    : `Previews render on ${m.model || "the model being trained"}: ${how}, no Turbo LoRA.`;
+  box.style.display = "";
+}
+
+// ---- Start tab: the News card (fizgig/web/news.py, newest first) ----------------------------------------------
+function newsCard() {
+  const host = $("newsCard");
+  const items = (S.schema.news || []).slice(0, 3);
+  host.style.display = items.length ? "" : "none";
+  const body = $("newsBody");
+  body.innerHTML = "";
+  for (const it of items) {
+    const item = el("div", {class: "news-item"},
+      el("div", {class: "news-head"}, el("b", {text: it.title}), el("span", {class: "field-hint", text: " · " + it.date})));
+    for (const para of String(it.body || "").split("\n\n")) item.append(el("p", {class: "news-text", text: para}));
+    if (it.links && it.links.length) item.append(el("div", {class: "news-links"}, ...it.links.map((l) =>
+      el("a", {class: "inline-link", target: "_blank", rel: "noopener", href: l.href, text: l.text + " →"}))));
+    body.append(item);
+  }
+}
+
 // ---- Start tab: your training data (the folders in the training data folder) ---------------------------------
 async function loadDatasets() {
   try { S.datasets = await api("/api/datasets"); } catch (e) { return; }
-  $("datasetsDesc").textContent = `The folders in ${S.datasets.root}, and the ones you've picked from anywhere ` +
-    "else (outlined). Click one to train on it; upload a new one below, or pick any folder with Choose… above.";
+  $("datasetsDesc").textContent = `A shortcut: the folders in ${S.datasets.root}, and the ones you've picked from ` +
+    "anywhere else (outlined). Click one to make it the training folder above. For a folder that isn't listed " +
+    "(another drive, or a subfolder), press Choose… above; to add a new one, upload it below.";
   $("datasetsSearchRow").style.display = S.datasets.total > 8 ? "" : "none";
   renderDatasets();
 }
 
 // a dataset's pictures in the viewer, stepping through them all
 async function datasetPictures(d) {
-  const r = await api(`/api/captions?folder=${encodeURIComponent(d.path)}&ext=${encodeURIComponent(capExt())}`)
+  const r = await api(`/api/captions?folder=${encodeURIComponent(d.path)}&ext=${encodeURIComponent(capExt())}&family=${encodeURIComponent(S.family || "")}`)
     .catch(() => ({items: []}));
   const q = (p) => `/api/media?path=${encodeURIComponent(p)}&t=${encodeURIComponent(TOKEN)}`;
   const pics = r.items.filter((it) => /\.(png|jpe?g|webp|bmp|avif|gif)$/i.test(it.name))
@@ -1735,7 +2141,7 @@ function imageLossPanel(box, d, run) {
   const sort = el("select", {class: "w-combo"}, ...[["hard", "Hardest now first"], ["easy", "Easiest now first"],
     ["verdict", "By verdict"], ["name", "By name"]].map(([v, t]) => el("option", {value: v, text: t})));
   const show = el("select", {class: "w-combo"}, el("option", {value: "all", text: "All images"}),
-    el("option", {value: "problems", text: "Problems only (excluded, stuck, suspect, watch)"}));
+    el("option", {value: "problems", text: "Worth a look (excluded, stuck, suspect, watching)"}));
   const grid = el("div", {class: "il-grid"}), pager = el("div", {class: "field-row"});
   let page = 0;
   const draw = () => {
@@ -1747,7 +2153,7 @@ function imageLossPanel(box, d, run) {
     const pages = Math.max(1, Math.ceil(list.length / IL_PAGE));
     page = Math.min(page, pages - 1);
     grid.replaceChildren(...list.slice(page * IL_PAGE, (page + 1) * IL_PAGE).map((im) => imageLossTile(im, ymax, run, d.live)));
-    if (!list.length) grid.append(el("div", {class: "field-hint", text: "No image has a problem verdict."}));
+    if (!list.length) grid.append(el("div", {class: "field-hint", text: "No image needs a look right now."}));
     pager.replaceChildren(...(pages > 1 ? [
       el("button", {class: "btn btn-sm", text: "‹ Prev", disabled: page === 0, onclick: () => { page--; draw(); }}),
       el("span", {class: "field-hint", text: `page ${page + 1} of ${pages}`}),
@@ -1806,7 +2212,7 @@ function imageLossCaption(im, run, live) {
     box.style.display = "";
     box.replaceChildren(el("div", {class: "field-hint", text: "Loading…"}));
     let r;
-    try { r = await api(`/api/runs/caption?id=${encodeURIComponent(run.id)}&key=${encodeURIComponent(im.key)}&ext=${encodeURIComponent(capExt())}`); }
+    try { r = await api(`/api/runs/caption?id=${encodeURIComponent(run.id)}&key=${encodeURIComponent(im.key)}&ext=${encodeURIComponent(capExt())}&family=${encodeURIComponent(S.family || "")}`); }
     catch (e) { box.replaceChildren(el("div", {class: "problems", text: e.message})); return; }
     const ta = el("textarea", {rows: 5, class: "il-cap-text"});
     ta.value = r.caption;
@@ -1959,6 +2365,7 @@ async function rySheet(confirm) {
     }
     if (r.family !== $("ryFamily").value) await royaleFamily(r.family);
     $("ryCSheet").style.display = "none";
+    $("ryCStatus").textContent = "Starting…";    // the Render it button goes, so the poll's progress shows (#215)
     ryRemember(); ryTravelPoll();
   } catch (e) { $("ryCStatus").textContent = e.message; }
 }
@@ -1972,7 +2379,8 @@ async function ryTravelPoll() {
     running = running || t.state === "rendering";
     if (mode === "sheet") {
       $("ryCGo").disabled = t.state === "rendering";
-      if (t.status) $("ryCStatus").textContent = t.status;
+      // not over the big sheet's Render it button (#215, @Nessa2026691)
+      if (t.status && !$("ryCStatus").querySelector("button")) $("ryCStatus").textContent = t.status;
       if (t.state === "done" && t.sheet && S.ry.tr.sheet !== t.gen) {
         S.ry.tr.sheet = t.gen;
         $("ryCImg").src = `/api/royale/travel/image?mode=sheet&g=${t.gen}&t=${encodeURIComponent(TOKEN)}`;
@@ -2177,7 +2585,8 @@ async function royaleScore() {
     if (r.best == null) { $("ryLikeStatus").textContent = "No faces detected in the renders or subject image."; $("ryBest").disabled = true; return; }
     $("ryBest").disabled = false;
     $("ryLikeStatus").textContent = `Best: ${ryLabel(r.best).toLowerCase()} (${r.scores[r.best].toFixed(3)})` +
-      (r.no_face ? `  (${r.no_face} no-face)` : "");
+      (r.no_face ? `  (${r.no_face} no-face)` : "") +
+      (r.embedder && !r.embedder.startsWith("ArcFace") ? `  · ${r.embedder}` : "");     // named when it isn't the usual one
     royaleBest();
   } catch (e) { $("ryLikeStatus").textContent = e.message; }
 }
@@ -2333,7 +2742,9 @@ async function profilerToStudio() {
   for (let i = 0; i < 100 && !(S.st.familiesLoaded && S.st.layout); i++) await new Promise((r) => setTimeout(r, 100));
   if ($("stFamily").value !== h.family) { $("stFamily").value = h.family; await studioFamily(); }
   $("stPrimary").value = h.lora; $("stPrompt").value = h.prompt; $("stSeed").value = String(h.seed);
-  if ([...$("stRes").options].some((o) => o.value === String(h.size))) $("stRes").value = String(h.size);
+  const [hw, hh] = Array.isArray(h.size) ? h.size : [h.size, h.size];
+  if ([...$("stW").options].some((o) => o.value === String(hw))) $("stW").value = String(hw);
+  if ([...$("stH").options].some((o) => o.value === String(hh))) $("stH").value = String(hh);
   for (const [id, b] of Object.entries(S.st.blocks)) {
     const [on, strength] = h.blocks[id] || [true, 1.0];
     b.pe = !!on; b.ps = Number(strength);
@@ -2781,18 +3192,32 @@ async function runLossTick(training) {
   host.replaceChildren(lossGraph(d));
 }
 
-// the Samples tab's "Change the previews of the run going now": its prompts, seed and size go to the run as the
+// the Samples tab's "Change the previews of the run going now": its prompts, seed, size, steps, CFG and Turbo
+// strength go to the run as the
 // trainer's sample override while ticked (sent again on every change), and come off when it's unticked
 const sampleLiveSoon = debounce(async () => {
   const v = S.values, note = $("note___SAMPLE_LIVE");
   try {
     const r = await api("/api/run/sample_override", {on: !!v.__SAMPLE_LIVE, prompts: v.SAMPLE_PROMPT || "",
-      seed: v.SAMPLE_SEED, width: v.SAMPLE_WIDTH, height: v.SAMPLE_HEIGHT});
+      seed: v.SAMPLE_SEED, width: v.SAMPLE_WIDTH, height: v.SAMPLE_HEIGHT, steps: v.SAMPLE_STEPS,
+      cfg: v.SAMPLE_CFG_SCALE, turbo: v.FAMILY_TURBO_STRENGTH, every: v.SAMPLE_EVERY_N_EPOCHS,
+      until: v.SAMPLE_LATER ? v.SAMPLE_UNTIL_EPOCH : 0, after: v.SAMPLE_LATER ? v.SAMPLE_EVERY_AFTER : 0,
+      look: !!v.FAMILY_PREVIEW_LOOK});
     if (note) note.textContent = r.on ? "Sent: the run's next previews use these." : "The run is back on its own prompts.";
   } catch (e) {
-    if (note) note.textContent = e.message;
+    if (note) note.textContent = S.run && (S.run.running || S.run.state === "starting") ? e.message : liveIdleText();
   }
 }, 700);
+
+// the tick's note follows the run: what a change would do now, never an old message from before the run started
+const liveIdleText = () => "On: a change here goes to a run while it trains, from its next preview.";
+function liveNote(live) {
+  const note = $("note___SAMPLE_LIVE");
+  if (!note || S._liveNoteFor === live) return;
+  S._liveNoteFor = live;
+  note.textContent = !S.values.__SAMPLE_LIVE ? "" : live ?
+    "On: a change here goes to the run training now, from its next preview." : liveIdleText();
+}
 
 // a run's model, training folder and settings into the form (Start again, a queued run's Edit)
 async function loadIntoForm(s) {
@@ -2802,7 +3227,11 @@ async function loadIntoForm(s) {
   // a run recorded before it had a Turbo value: its steps and CFG follow the Turbo on now (refreshState)
   if (!("FAMILY_TURBO_STRENGTH" in kept)) delete S.values.__turbo_live;
   S.all[S.family] = S.values;
-  if (s.image_folder) { $("imageFolder").value = s.image_folder; S.imageFolder = s.image_folder; await loadTrigger(); }
+  if (s.image_folder) {
+    const was = S.imageFolder;
+    $("imageFolder").value = s.image_folder; S.imageFolder = s.image_folder; await loadTrigger();
+    if (S.imageFolder !== was) lookForget();
+  }
   renderSections("samples", $("samplesForm"));
   renderSections("training", $("trainingForm"));
   await refreshState();
@@ -2826,7 +3255,7 @@ async function runFiles(run) {
       .catch(() => ({items: [], prompts: []})),
     api("/api/checkpoints?dir=" + encodeURIComponent(run.output_dir)).catch(() => ({items: []}))]);
   const shots = g.items.slice(0, 12);
-  if (shots.length) out.push(el("div", {class: "gallery run-gallery"}, shots.map((it) => previewFigure(it, g.prompts))));
+  if (shots.length) out.push(el("div", {class: "gallery run-gallery"}, shots.map((it) => previewFigure(it, g.prompts, null, g.epoch_prompts))));
   const size = (b) => b >= 2 ** 30 ? (b / 2 ** 30).toFixed(1) + " GB" : (b / 2 ** 20).toFixed(0) + " MB";
   const ckpts = c.items.filter((it) => it.run === run.lora);
   if (ckpts.length) out.push(el("div", {class: "checkpoint-list"}, ckpts.map((it) => el("div", {class: "checkpoint-row"},
@@ -2952,6 +3381,7 @@ async function loadPrep() {
     document.querySelectorAll('input[name="prepMode"]').forEach((r) => { r.checked = r.value === mode; });
     document.querySelectorAll('input[name="prepReplace"]').forEach((r) => { r.checked = r.value === (saved.replace ? "1" : "0"); });
     $("prepNoFaces").style.display = o.face_tools ? "none" : "";
+    faceSettingsShow(o.face_settings);
   }
   $("prepFolder").textContent = S.imageFolder ? `Folder: ${S.imageFolder}  (set on the Start tab)` :
     "Choose the training folder on the Start tab first.";
@@ -3004,6 +3434,68 @@ async function prepRun() {
   } catch (e) { $("prepState").textContent = e.message; }
 }
 
+// Image Prep's "Anime/furry/drawn characters" (fizgig/face_utils.py, prefs.json face_*): saved as soon as they
+// change. InsightFace + ArcFace are the defaults; the section opens by itself when something else is chosen.
+const FACE_HINTS = {
+  insightface: "For people. It can tell men from women, for Largest Male / Female Face. It doesn't see anime, furry " +
+    "or drawn faces.",
+  yolo: "For anime, furry or drawn characters, and fursuits, pick this. It can't tell men from women, so Largest " +
+    "Male / Female Face use the largest face.",
+  auto: "For a set with both people and characters in it. Both finders look at every picture, so it's a little slower."};
+const LOOK_HINTS = {
+  arcface: "For people's faces. For anime, furry or drawn characters, pick Anime/furry/drawn.",
+  dinov2: "For anime, furry or drawn characters, and fursuits; it works on people too. Its scores run higher than the people setting's, and " +
+    "the colours follow.",
+  auto: "Fizgig looks at some of the pictures each time it scores: People (the default) for a set of people, " +
+    "Anime/furry/drawn for anything else."};
+function faceSettingsShow(f, msg) {
+  if (!f) return;
+  S.prep.face = f;
+  for (const [id, list, v] of [["prepDetector", f.detectors, f.detector], ["prepIdentity", f.identities, f.identity]]) {
+    $(id).innerHTML = "";
+    for (const [k, label] of list) $(id).append(el("option", {value: k, text: label}));
+    $(id).value = v;
+  }
+  if (document.activeElement !== $("prepYolo")) $("prepYolo").value = f.yolo_model;
+  $("prepYoloRow").style.display = f.detector === "insightface" ? "none" : "";
+  $("prepDetectorHint").textContent = FACE_HINTS[f.detector] || "";
+  $("prepIdentityHint").textContent = f.identity === "auto" && f.detector !== "auto" ?
+    `With this face finder that means ${f.detector === "yolo" ? "Anime/furry/drawn" : "People (the default)"}.` :
+    LOOK_HINTS[f.identity] || "";
+  $("prepYoloHint").textContent = `Blank: Fdetailer if it's saved as ${f.local_model}, otherwise a free anime head ` +
+    "finder that downloads the first time it's used. docs/FACE_BACKENDS.md explains how to get Fdetailer.";
+  $("prepFaceMsg").textContent = msg || "";
+  const custom = f.defaults && (f.detector !== f.defaults.detector || f.identity !== f.defaults.identity);
+  if (custom) $("prepChars").open = true;              // never hide a choice that is changing what you get
+}
+async function faceSettingsSave(changes, msg) {
+  try { faceSettingsShow(await api("/api/prep/face_settings", changes), msg); }
+  catch (e) { $("prepFaceMsg").textContent = e.message; }
+}
+function faceSettingsWire() {
+  $("prepDetector").addEventListener("change", () => {
+    const det = $("prepDetector").value, f = S.prep.face || {};
+    // a YOLO face finder with the people-only look match would score nothing: the look match follows, said aloud
+    if (det !== "insightface" && f.identity === "arcface") {
+      const ident = det === "yolo" ? "dinov2" : "auto";
+      return faceSettingsSave({detector: det, identity: ident}, `Look match changed to ${ident === "dinov2" ?
+        "Anime/furry/drawn" : "Auto (Decide for each set)"}, so characters' faces get scored too.`);
+    }
+    faceSettingsSave({detector: det});
+  });
+  $("prepIdentity").addEventListener("change", () => faceSettingsSave({identity: $("prepIdentity").value}));
+  // the YOLO face model: the standard path row (type, Choose… on the Fizgig machine, or Upload… from this device)
+  const input = $("prepYolo"), set = (p) => faceSettingsSave({yolo_model: p});
+  input.addEventListener("change", () => set(input.value.trim()));
+  const row = $("prepYoloPick");
+  row.append(el("button", {class: "btn", text: "Choose…", title: "Pick from what is on the machine running Fizgig",
+    onclick: () => pick(input.value || ((S.prep.face || {}).local_model || "").replace(/[\\/][^\\/]*$/, ""), false,
+      (p) => { input.value = p; set(p); })}));
+  const up = uploadButton({kind: "path", key: "FACE_YOLO_MODEL", accept: ".onnx"}, input, set);
+  row.append(up.btn);
+  $("prepYoloRow").append(up.status);
+}
+
 function prepTest() {
   pick(S.imageFolder, false, async (path) => {
     const host = $("prepTestResult");
@@ -3012,7 +3504,7 @@ function prepTest() {
       const r = await api("/api/prep/test", {path, face: $("prepFace").value});
       if (!r.faces.length) { host.replaceChildren(el("div", {class: "field-hint", text: "No faces found in that photo."})); return; }
       host.replaceChildren(
-        el("div", {class: "field-hint", text: `${r.faces.length} face${r.faces.length === 1 ? "" : "s"} found: ` +
+        el("div", {class: "field-hint", text: `${r.faces.length} face${r.faces.length === 1 ? "" : "s"} found (${r.finder}): ` +
           r.faces.map((f, i) => `face ${i + 1}, ${f.gender === "unknown" ? "?" : f.gender}, ${f.area.toLocaleString()} px` +
             (f.selected ? " (chosen for the crop)" : "")).join("; ") + ". Green = chosen, yellow = the others."}),
         el("img", {class: "prep-test-img", src: r.image, alt: "faces found"}));
@@ -3021,6 +3513,14 @@ function prepTest() {
 }
 
 // ---- the Look Filter ----
+function lookForget() {
+  // a new training folder starts with no baselines or marks (#218); its own last scan, if any, comes back with the poll
+  Object.assign(S.prep, {bases: [], marked: new Set(), page: 0, picking: false});
+  $("lookPicker").style.display = "none";
+  lookBasesShow();
+  lookPoll();
+}
+
 async function lookPickOpen() {
   const host = $("lookPicker");
   if (S.prep.picking) { S.prep.picking = false; host.style.display = "none"; return; }
@@ -3028,7 +3528,7 @@ async function lookPickOpen() {
   S.prep.picking = true;
   host.style.display = "";
   host.replaceChildren(el("div", {class: "field-hint", text: "Loading the folder's pictures…"}));
-  const r = await api(`/api/captions?folder=${encodeURIComponent(S.imageFolder)}&ext=${encodeURIComponent(capExt())}`).catch(() => ({items: []}));
+  const r = await api(`/api/captions?folder=${encodeURIComponent(S.imageFolder)}&ext=${encodeURIComponent(capExt())}&family=${encodeURIComponent(S.family || "")}`).catch(() => ({items: []}));
   const pics = r.items.filter((it) => /\.(png|jpe?g|webp|bmp)$/i.test(it.name));
   host.replaceChildren(el("div", {class: "field-hint look-pick-hint", text: "Click the 3 pictures that best nail the look you want."}),
     ...pics.map((it) => el("button", {class: "look-tile pick" + (S.prep.bases.includes(it.path) ? " chosen" : ""),
@@ -3059,14 +3559,18 @@ async function lookScan() {
 
 async function lookPoll() {
   clearTimeout(S.prep.lookTimer);
+  if (S.prep.intro == null) S.prep.intro = $("lookStatus").textContent;    // the card's own words, for a new folder
   const r = await api("/api/look/status").catch(() => null);
   if (!r) return;
   S.prep.look = r;
+  $("lookDecision").textContent = r.decision ? r.decision.replace("[faces] ", "") : "";
+  const mine = r.folder === S.imageFolder;        // the last scan may be of another folder
   if (r.state === "running") {
     $("lookStatus").textContent = r.progress[0] ? `Scoring faces… ${r.progress[0]}/${r.progress[1]}` :
-      "Loading the face model (the first time downloads about 300 MB)…";
+      "Loading the face model and choosing the look match (the first time downloads about 300 MB)…";
     S.prep.lookTimer = setTimeout(lookPoll, 1000);
   } else if (r.state === "failed") $("lookStatus").textContent = r.error;
+  else if (r.state === "done" && r.rows.length && !mine) $("lookStatus").textContent = S.prep.intro;
   else if (r.state === "done" && r.rows.length) {
     if (!S.prep.bases.length) { S.prep.bases = r.baselines; lookBasesShow(); }
     const faces = r.rows.filter((x) => x.score != null).length;
@@ -3170,6 +3674,7 @@ function wirePrep() {
   for (const id of ["prepMp", "prepFace", "prepPadding"]) $(id).addEventListener("change", () => { prepSummary(); savePrepSoon(); });
   $("prepRun").addEventListener("click", prepRun);
   $("prepTest").addEventListener("click", prepTest);
+  faceSettingsWire();
   $("lookPick").addEventListener("click", lookPickOpen);
   $("lookScan").addEventListener("click", lookScan);
   $("lookSuggest").addEventListener("click", lookSuggest);
@@ -3186,9 +3691,10 @@ const ST_KEY = "fizgig_studio";
 const stSaved = () => { try { return JSON.parse(localStorage.getItem(ST_KEY) || "{}"); } catch (e) { return {}; } };
 const stRemember = debounce(() => {
   const d = {family: $("stFamily").value, primary: $("stPrimary").value, donor: $("stDonor").value,
-    prompt: $("stPrompt").value, seed: $("stSeed").value, res: $("stRes").value, turbo: $("stTurbo").checked,
+    prompt: $("stPrompt").value, seed: $("stSeed").value, res: $("stRes").value,
+    w: $("stW").value, h: $("stH").value, turbo: $("stTurbo").checked,
     ref: $("stRef").value, refMp: $("stRefMp").value, refStr: $("stRefStr").value, luckyLo: $("stLuckyLo").value,
-    luckyHi: $("stLuckyHi").value, neg: {...(stSaved().neg || {}), [$("stFamily").value]: $("stNeg").value},
+    luckyHi: $("stLuckyHi").value, luckyWho: $("stLuckyWho").value, luckyCount: $("stLuckyCount").value, neg: {...(stSaved().neg || {}), [$("stFamily").value]: $("stNeg").value},
     scales: {...(stSaved().scales || {}), [$("stFamily").value]: [$("stPScale").value, $("stDScale").value]},
     h3: stSaved().h3, ace: stSaved().ace, metricsRef: stSaved().metricsRef};                           // H3's clip settings and photos (studioH3Remember's)
   try { localStorage.setItem(ST_KEY, JSON.stringify(d)); } catch (e) { /* private window */ }
@@ -3209,16 +3715,16 @@ async function studioOpen() {
     const sv = stSaved();
     if (sv.family && r.families.some((f) => f.key === sv.family)) sel.value = sv.family;
     for (const [id, k] of [["stPrimary", "primary"], ["stDonor", "donor"], ["stPrompt", "prompt"], ["stSeed", "seed"],
-      ["stRef", "ref"], ["stRefMp", "refMp"], ["stRefStr", "refStr"], ["stLuckyLo", "luckyLo"], ["stLuckyHi", "luckyHi"]])
+      ["stRef", "ref"], ["stRefMp", "refMp"], ["stRefStr", "refStr"], ["stLuckyLo", "luckyLo"], ["stLuckyHi", "luckyHi"], ["stLuckyWho", "luckyWho"]])
       if (sv[k] != null && sv[k] !== "") $(id).value = sv[k];
     if (sv.turbo != null) $("stTurbo").checked = sv.turbo;
     S.st.familiesLoaded = true;
-    await studioFamily(sv.res);
+    await studioFamily(sv.res, sv.w, sv.h);
   }
   studioPoll();
 }
 
-async function studioFamily(res) {
+async function studioFamily(res, w, h) {
   const key = $("stFamily").value;
   const L = S.st.layout = await api("/api/studio/layout?family=" + encodeURIComponent(key));
   const sv = stSaved();
@@ -3226,6 +3732,12 @@ async function studioFamily(res) {
   $("stRes").innerHTML = "";
   for (const s of L.sizes) $("stRes").append(el("option", {value: s, text: s}));
   $("stRes").value = L.sizes.includes(String(res)) ? String(res) : L.size;
+  for (const [id, v] of [["stW", w], ["stH", h]]) {             // pictures: any width and height from the list
+    const keep = String(v ?? $(id).value);
+    $(id).innerHTML = "";
+    for (const s of L.sizes) $(id).append(el("option", {value: s, text: s}));
+    $(id).value = L.sizes.includes(keep) ? keep : L.size;
+  }
   const sc = (sv.scales || {})[key];
   $("stPScale").value = sc ? sc[0] : L.default_strength;
   $("stDScale").value = sc ? sc[1] : 1;
@@ -3243,7 +3755,9 @@ async function studioFamily(res) {
   studioNegRow();
   S.st.blocks = {};
   for (const g of L.groups) for (const b of g.blocks) S.st.blocks[b.id] = {pe: true, ps: 1, de: true, ds: 1};
-  S.st.locks = new Set(); S.st.hist = []; S.st.redo = [];
+  S.st.locks = new Set(); S.st.dlocks = new Set(); S.st.frozen = new Set(); S.st.dfrozen = new Set();
+  S.st.hist = []; S.st.redo = [];
+  studioLuckyCounts();
   studioMasters();
   studioPresets();
   studioRows();
@@ -3252,10 +3766,23 @@ async function studioFamily(res) {
 // H3 (clips) and ACE-Step (songs): their own controls, the desktop's
 function studioKind(L, sv) {
   const video = L.kind === "video", audio = L.kind === "audio";
+  if (S.st.kindShown && S.st.kindShown !== L.kind) {     // pictures / clips / songs: the last kind's previews go
+    for (const id of ["stBase", "stTweak", "stNol"]) $(id).removeAttribute("src");
+    for (const id of ["stBaseVid", "stTweakVid", "stNolVid", "stBaseAud", "stTweakAud", "stNolAud"]) {
+      const m = $(id);
+      m.pause(); m.removeAttribute("src"); m.removeAttribute("poster"); m.load(); m.style.display = "none";
+    }
+    $("stDownloads").style.display = "none";
+    if (S.song) { S.song.src = {}; S.song.peaks = {}; S.song.act = {}; }     // a song comes back fresh, not "already loaded"
+  }
+  S.st.kindShown = L.kind;
   $("stVideoRows").style.display = video ? "" : "none";
   $("stFrames").style.display = video ? "" : "none";
-  $("stResLabel").textContent = audio ? "Length (s):" : "Res:";
-  $("stRes").style.display = $("stResLabel").style.display = video ? "none" : "";
+  $("stRes").style.display = $("stResLabel").style.display = audio ? "" : "none";      // a song's length
+  if (audio) studioDock(false, false);                  // Keep in view: never for a music model (kept as remembered)
+  else if (stDockSaved().open && !$("stDock")) studioDock(true);
+  else studioDock(!!$("stDock"));
+  $("stSizeRow").style.display = video || audio ? "none" : "";                          // a picture's width and height
   document.querySelectorAll(".st-pane").forEach((p) => p.classList.toggle("audio", audio));
   $("stPreviewHint").textContent = video ? "Each clip plays with its sound; the picture is its middle frame." :
     audio ? "Play any song; the picture is its waveform." : "Click either picture to see both full size (← → switches between them).";
@@ -3277,12 +3804,12 @@ function studioKind(L, sv) {
   fill("stH3Len", V.lengths, h3.len || V.length);
   fill("stH3W", V.dims, h3.w || V.size[0]);
   fill("stH3H", V.dims, h3.h || V.size[1]);
-  fill("stH3Scale", V.scales, h3.scale || "Full");
   if (h3.steps) $("stH3Steps").value = h3.steps;
   if (h3.turbo != null) $("stH3Turbo").value = h3.turbo;
   $("stH3Sound").checked = V.sound && h3.sound !== false;
   $("stH3Sound").disabled = !V.sound;
-  $("stH3NoLora").checked = !!h3.nolora;
+  $("stH3Boost").checked = h3.boost !== false;           // on unless turned off
+  $("stH3Boost").parentElement.style.display = V.speed_boost ? "" : "none";   // a family ability (H3 has it)
   $("stH3Early").checked = h3.early !== false;
   S.st.kf = h3.kf || {};
   S.st.kfRect = h3.kfRect || {};
@@ -3421,8 +3948,8 @@ function studioH3Remember() {
   try {
     const d = stSaved();
     d.h3 = {model: $("stH3Model").value, base: $("stH3Base").value, len: $("stH3Len").value, w: $("stH3W").value,
-      h: $("stH3H").value, scale: $("stH3Scale").value, steps: $("stH3Steps").value, turbo: $("stH3Turbo").value,
-      sound: $("stH3Sound").checked, nolora: $("stH3NoLora").checked, early: $("stH3Early").checked, kf: S.st.kf,
+      h: $("stH3H").value, steps: $("stH3Steps").value, turbo: $("stH3Turbo").value,
+      sound: $("stH3Sound").checked, boost: $("stH3Boost").checked, early: $("stH3Early").checked, kf: S.st.kf,
       kfRect: S.st.kfRect};
     localStorage.setItem(ST_KEY, JSON.stringify(d));
   } catch (e) { /* private window */ }
@@ -3433,15 +3960,14 @@ function studioExtra() {
   const L = S.st.layout;
   if (L.kind === "audio") return {audio: studioAceExtra()};
   if (L.kind !== "video") return {};
-  const V = L.video, f = V.scale_of[$("stH3Scale").value] || 1;
-  const snap = (x) => f >= 0.999 ? x : Math.max(256, Math.floor(x * f / 32) * 32);
-  const w = snap(Number($("stH3W").value) || 640), h = snap(Number($("stH3H").value) || 768);
+  const V = L.video;
+  const w = Number($("stH3W").value) || 640, h = Number($("stH3H").value) || 768;     // the clip at its Width x Height
   const ref = !!V.references[$("stH3Model").value];
   const slots = ref ? ["ref1", "ref2"] : ["first", "last"];
   return {video: {frames: V.length_frames[$("stH3Len").value] || 22, width: w, height: h,
     steps: Math.max(1, Math.min(40, parseInt($("stH3Steps").value, 10) || 4)),
     turbo: Math.max(0, Math.min(1.5, Number($("stH3Turbo").value) || 0)), sound: $("stH3Sound").checked,
-    nolora: $("stH3NoLora").checked, early: $("stH3Early").checked},
+    speed_boost: !!V.speed_boost && $("stH3Boost").checked, early: $("stH3Early").checked},
     keyframes: slots.filter((s) => S.st.kf[s]).map((s) => ({slot: s, path: S.st.kf[s], rect: S.st.kfRect[s] || null})),
     ref_mode: ref};
 }
@@ -4052,6 +4578,7 @@ async function studioMetrics() {
     const lb = m.like_base * 100, lt = m.like_tweak * 100, d = lt - lb;
     put("like", `Likeness ${lb.toFixed(0)}% ${d > 0.5 ? "▲" : d < -0.5 ? "▼" : "→"} ${lt.toFixed(0)}%`, d > 0.5 ? "good" : d < -0.5 ? "bad" : "");
   }
+  $(chips.like).title = m.embedder ? `Look match: ${m.embedder} (scores are on its own scale)` : "";
   put("grid", `Grid ${m.grid_base.toFixed(2)} → ${m.grid_tweak.toFixed(2)}`, m.grid_delta > 0.05 ? "bad" : m.grid_delta < -0.05 ? "good" : "");
   const td = (m.texture_tweak - m.texture_base) / Math.max(m.texture_base, 1e-6);
   put("tex", `Detail ${m.texture_base.toFixed(0)} → ${m.texture_tweak.toFixed(0)}`, Math.abs(td) > 0.10 ? "warm" : "");
@@ -4074,13 +4601,14 @@ const ST_SRC_MODES = [["song", "Whole song"], ["repaint", "Repaint the loop sect
 const ST_SETUP_MAP = [
   ["stPrimary", "repair_primary_var"], ["stDonor", "repair_donor_var"], ["stPScale", "repair_primary_scale_var"],
   ["stDScale", "repair_donor_scale_var"], ["stPrompt", "repair_prompt_var"], ["stSeed", "repair_seed_var"],
-  ["stRes", "repair_res_var"], ["stNeg", "repair_negative_var"], ["stTurbo", "repair_turbo_var", "check"],
+  ["stRes", "repair_res_var"], ["stW", "repair_width_var"], ["stH", "repair_height_var"], ["stNeg", "repair_negative_var"], ["stTurbo", "repair_turbo_var", "check"],
   ["stRef", "repair_ref_path_var"], ["stRefMp", "repair_ref_mp_var"], ["stRefStr", "repair_ref_strength_var"],
   ["stLuckyLo", "repair_lucky_min_var"], ["stLuckyHi", "repair_lucky_max_var"],
   ["stH3Model", "repair_h3_model_var"], ["stH3Base", "repair_h3_base_var"], ["stH3Len", "repair_h3_frames_var"],
-  ["stH3W", "repair_h3_width_var"], ["stH3H", "repair_h3_height_var"], ["stH3Scale", "repair_h3_dial_scale_var"],
+  ["stH3W", "repair_h3_width_var"], ["stH3H", "repair_h3_height_var"],
   ["stH3Steps", "repair_h3_steps_var"], ["stH3Turbo", "repair_h3_turbo_var"], ["stH3Sound", "repair_h3_sound_var", "check"],
-  ["stH3NoLora", "repair_h3_nolora_var", "check"], ["stH3Early", "repair_h3_early_var", "check"],
+  ["stH3Boost", "repair_h3_speed_boost_var", "check"],
+  ["stH3Early", "repair_h3_early_var", "check"],
   ["stPbOn", "repair_pb_on_var", "check"], ["stPromptB", "repair_prompt_b_var"], ["stPbBlend", "repair_pb_blend_var", "num"],
   ["stPbKeep", "repair_pb_keep_lyrics_var", "check"], ["stSrcOn", "repair_src_on_var", "check"],
   ["stSrcPath", "repair_src_path_var"], ["stSrcMode", "repair_src_mode_var", "srcmode"],
@@ -4245,10 +4773,13 @@ function studioRow(b) {
     const btn = (t, title, f) => el("button", {class: "btn btn-sm", text: t, title, onclick: () => { f(); studioCommit(); }});
     const label = side === "p" ? el("span", {class: "st-label", style: b.color ? `color:${b.color}` : ""},
       b.label, b.cat ? el("small", {text: `[${b.cat}]`}) : null) : el("span", {class: "st-label", text: "donor"});
-    const lock = side === "p" ? el("button", {class: "st-lock", title: "Lock this block (presets, Lucky and bulk leave it alone)",
-      text: "🔓", onclick: (e) => { S.st.locks.has(b.id) ? S.st.locks.delete(b.id) : S.st.locks.add(b.id);
-        e.currentTarget.textContent = S.st.locks.has(b.id) ? "🔒" : "🔓"; e.currentTarget.classList.toggle("on"); }}) :
-      el("span", {});
+    const locks = () => side === "p" ? S.st.locks : S.st.dlocks, frozen = () => side === "p" ? S.st.frozen : S.st.dfrozen;
+    const lock = el("button", {class: "st-lock", title: side === "p" ?
+      "Lock this slider (presets, Lucky and bulk leave it alone; the donor's slider has its own lock)" :
+      "Lock the donor's slider for this block (presets, Lucky and bulk leave it alone)",
+      text: "🔓", onclick: () => {
+        if (locks().has(b.id)) { locks().delete(b.id); frozen().delete(b.id); } else locks().add(b.id);
+        studioSync([b.id]); }});
     const row = el("div", {class: "st-row" + (side === "d" ? " donor" : "")}, lock, tick, label, range, val,
       el("span", {class: "st-btns"},
         btn("0", "Set to 0", () => studioSet(b.id, sv, 0)), btn("1", "Set to 1", () => studioSet(b.id, sv, 1)),
@@ -4259,7 +4790,8 @@ function studioRow(b) {
           const o = side === "p" ? "ds" : "ps", v = st()[sv];
           if (S.st.donor && v >= 0 && v <= 1) { studioSet(b.id, o, Math.round((1 - v) * 100) / 100); studioSet(b.id, "de", true); }
         })));
-    row._sync = () => { tick.checked = st()[en]; range.value = st()[sv]; val.textContent = stFmt(st()[sv]); };
+    row._sync = () => { tick.checked = st()[en]; range.value = st()[sv]; val.textContent = stFmt(st()[sv]);
+      const on = locks().has(b.id); lock.textContent = on ? "🔒" : "🔓"; lock.classList.toggle("on", on); };
     row._sync();
     return row;
   };
@@ -4274,6 +4806,62 @@ function studioSync(ids) {
   document.querySelectorAll("#stBlocks .st-block").forEach((box) => {
     if (!ids || ids.includes(box.dataset.id)) box._rows.forEach((r) => r._sync());
   });
+  studioFreezeState();
+}
+
+// ---- I'm feeling lucky's pill: how many blocks a roll changes, and Freeze / Unfreeze the ones you've moved ----------
+function studioLuckyCounts() {                     // Roll: 1, 2, 4 ... below the model's block count, then All
+  const n = Object.keys(S.st.blocks).length, sel = $("stLuckyCount"), keep = stSaved().luckyCount || sel.value;
+  sel.innerHTML = "";
+  for (let k = 1; k < n; k *= 2) sel.append(el("option", {value: String(k), text: String(k)}));
+  sel.append(el("option", {value: "all", text: "All"}));
+  sel.value = [...sel.options].some((o) => o.value === keep) ? keep : "all";
+}
+
+function studioLuckyPool() {                      // the blocks a roll can change: on for the LoRA it rolls, not locked
+  const who = S.st.donor ? $("stLuckyWho").value : "Primary";
+  const pOk = (id) => who !== "Donor" && !S.st.locks.has(id) && !(S.st.ready && !S.st.primaryBlocks.has(id)) && S.st.blocks[id].pe;
+  const dOk = (id) => who !== "Primary" && !S.st.dlocks.has(id) && S.st.donorBlocks.has(id) && S.st.blocks[id].de;
+  const ids = Object.keys(S.st.blocks);
+  return {pOk, dOk, who, pool: ids.filter((id) => pOk(id) || dOk(id)),
+          free: ids.filter(pOk).length + ids.filter(dOk).length,       // sliders a roll can change
+          total: (who !== "Donor" ? ids.length : 0) + (who !== "Primary" ? ids.length : 0)};
+}
+
+function studioTweaked(id, side) {                 // a slider moved from its default (its strength or on / off)
+  const b = S.st.blocks[id];
+  if (!b) return false;
+  if (side === "d") return !!(S.st.donor && S.st.donorBlocks.has(id) && (b.ds !== 1 || !b.de));
+  return !(S.st.ready && !S.st.primaryBlocks.has(id)) && (b.ps !== 1 || !b.pe);
+}
+
+function studioFreezeState() {
+  if (!$("stFreeze") || !S.st.frozen) return;
+  const ids = Object.keys(S.st.blocks);
+  const fresh = ids.filter((id) => studioTweaked(id, "p") && !S.st.locks.has(id)).length +
+    ids.filter((id) => studioTweaked(id, "d") && !S.st.dlocks.has(id)).length;
+  const held = S.st.frozen.size + S.st.dfrozen.size;
+  $("stFreeze").textContent = `🔒 Freeze tweaked${fresh ? ` (${fresh})` : ""}`;
+  $("stFreeze").disabled = !fresh;
+  $("stUnfreeze").style.display = held ? "" : "none";
+  $("stUnfreeze").textContent = `🔓 Unfreeze (${held})`;
+  // what is left to roll: not frozen, not locked by hand, on for the LoRA being rolled (the dropdown's sliders)
+  const pl = studioLuckyPool();
+  $("stLuckyFree").textContent = pl.total ? `${pl.free} of ${pl.total} sliders free to roll` : "";
+}
+
+function studioFreeze(on) {
+  if (on) {
+    for (const id of Object.keys(S.st.blocks)) {
+      if (studioTweaked(id, "p") && !S.st.locks.has(id)) { S.st.locks.add(id); S.st.frozen.add(id); }
+      if (studioTweaked(id, "d") && !S.st.dlocks.has(id)) { S.st.dlocks.add(id); S.st.dfrozen.add(id); }
+    }
+  } else {
+    for (const id of S.st.frozen) S.st.locks.delete(id);
+    for (const id of S.st.dfrozen) S.st.dlocks.delete(id);
+    S.st.frozen.clear(); S.st.dfrozen.clear();
+  }
+  studioSync();
 }
 
 function studioActivity() {
@@ -4297,10 +4885,11 @@ function studioActivity() {
   document.querySelectorAll(".st-detail-only").forEach((x) => {
     x.style.display = S.st.layout && (S.st.layout.detail_blocks || []).length ? "" : "none"; });
   $("stTargetDonor").disabled = !S.st.donor;
+  studioFreezeState();                             // a donor in or out changes what is free to roll
 }
 
 function studioSet(id, k, v, live) {
-  if (S.st.locks.has(id)) { studioSync([id]); return; }
+  if ((k === "ds" || k === "de" ? S.st.dlocks : S.st.locks).has(id)) { studioSync([id]); return; }
   S.st.blocks[id][k] = v;
   studioSync([id]);
   studioSchedule(live);
@@ -4335,7 +4924,7 @@ function studioMasters() {
       const donor = (document.querySelector('input[name="stTarget"]:checked') || {}).value === "donor";
       const has = donor ? S.st.donorBlocks : S.st.primaryBlocks;
       for (const [id, c] of Object.entries(L.category_of))
-        if (c === m.cat && (!S.st.ready || has.has(id)) && !S.st.locks.has(id)) S.st.blocks[id][donor ? "ds" : "ps"] = v;
+        if (c === m.cat && (!S.st.ready || has.has(id)) && !(donor ? S.st.dlocks : S.st.locks).has(id)) S.st.blocks[id][donor ? "ds" : "ps"] = v;
       range.value = v; val.textContent = stFmt(v);
       studioSync(); studioSchedule(true);
     };
@@ -4346,7 +4935,7 @@ function studioMasters() {
       const v = Number(range.value), donor = (document.querySelector('input[name="stTarget"]:checked') || {}).value === "donor";
       if (!(S.st.donorBlocks && S.st.donorBlocks.size) || v < 0 || v > 1) return;
       for (const [id, c] of Object.entries(L.category_of)) {
-        if (c !== m.cat || S.st.locks.has(id)) continue;
+        if (c !== m.cat || (donor ? S.st.locks : S.st.dlocks).has(id)) continue;     // the other side's lock
         if (donor) S.st.blocks[id].ps = Math.round((1 - v) * 100) / 100;
         else Object.assign(S.st.blocks[id], {ds: Math.round((1 - v) * 100) / 100, de: true});
       }
@@ -4386,15 +4975,20 @@ async function studioPresetApply(v) {
   if (v.startsWith("b:")) {
     const p = L.presets.find((x) => x.name === v.slice(2));
     for (const [id, b] of Object.entries(S.st.blocks)) {
+      if (!S.st.dlocks.has(id)) Object.assign(b, {de: true, ds: 1});
       if (S.st.locks.has(id)) continue;
-      Object.assign(b, {pe: true, ps: 1, de: true, ds: 1});
+      Object.assign(b, {pe: true, ps: 1});
       if (p.keep) b.pe = p.keep.includes(L.category_of[id]);
       if (p.blocks && id in p.blocks) { b.pe = true; b.ps = Number(p.blocks[id]); }
     }
   } else {
     const r = await api("/api/studio/preset_load", {family: L.key, name: v.slice(2)});
-    for (const [id, bs] of Object.entries(r.blocks || {})) if (S.st.blocks[id] && !S.st.locks.has(id))
-      S.st.blocks[id] = {pe: !!bs.primary_enabled, ps: Number(bs.primary_strength), de: !!bs.donor_enabled, ds: Number(bs.donor_strength)};
+    for (const [id, bs] of Object.entries(r.blocks || {})) {
+      const b = S.st.blocks[id];
+      if (!b) continue;
+      if (!S.st.locks.has(id)) Object.assign(b, {pe: !!bs.primary_enabled, ps: Number(bs.primary_strength)});
+      if (!S.st.dlocks.has(id)) Object.assign(b, {de: !!bs.donor_enabled, ds: Number(bs.donor_strength)});
+    }
   }
   studioSync(); studioCommit(); studioSchedule();
   $("stPreset").value = "";
@@ -4426,26 +5020,37 @@ function studioBulk(kind) {
   }
   let rolled = 0;
   for (const [id, b] of Object.entries(S.st.blocks)) {
-    if (S.st.locks.has(id)) continue;
-    if (kind === "reset") Object.assign(b, {pe: true, ps: 1, de: true, ds: 1});
-    else if (kind === "off") b.pe = false;
-    else if (kind === "on") b.pe = true;
-    else if (kind === "invert") b.pe = !b.pe;
-    else if (kind === "donor_on") Object.assign(b, {de: true, ds: 1});
-    else if (kind === "donor_off") b.ds = 0;
-    else if (kind === "lucky") {
-      if ((S.st.ready && !S.st.primaryBlocks.has(id)) || !b.pe) continue;
+    const p = !S.st.locks.has(id), d = !S.st.dlocks.has(id);
+    if (kind === "reset") { if (p) Object.assign(b, {pe: true, ps: 1}); if (d) Object.assign(b, {de: true, ds: 1}); }
+    else if (kind === "off") { if (p) b.pe = false; }
+    else if (kind === "on") { if (p) b.pe = true; }
+    else if (kind === "invert") { if (p) b.pe = !b.pe; }
+    else if (kind === "donor_on") { if (d) Object.assign(b, {de: true, ds: 1}); }
+    else if (kind === "donor_off") { if (d) b.ds = 0; }
+  }
+  if (kind === "lucky") {
+    // which LoRA rolls: the primary, or with a donor loaded the dropdown's choice (Both rolls each on its own)
+    // the sliders it can change (a block's primary and donor are two), shuffled, the Roll count of them
+    const {pOk, dOk} = studioLuckyPool();
+    const pool = Object.keys(S.st.blocks).flatMap((id) => [...(pOk(id) ? [[id, "ps"]] : []), ...(dOk(id) ? [[id, "ds"]] : [])]);
+    for (let j = pool.length - 1; j > 0; j--) { const k = Math.floor(Math.random() * (j + 1)); [pool[j], pool[k]] = [pool[k], pool[j]]; }
+    const want = $("stLuckyCount").value === "all" ? pool.length : Number($("stLuckyCount").value);
+    for (const [id, key] of pool.slice(0, want)) {
       // a held band (lucky_zones: [first, last, low, high] by the block's place in the model's order), bounded by
       // Min / Max as the desktop does
-      const i = order.indexOf(id);
+      const i = order.indexOf(id), b = S.st.blocks[id];
       const zone = $("stLuckyHold").checked ? (L.lucky_zones || []).find((zn) => zn[0] <= i && i <= zn[1]) : null;
       let a = zone ? Math.max(zone[2], lo) : lo, z = zone ? Math.min(zone[3], hi) : hi;
       if (a > z) a = z = Math.min(Math.max(1, lo), hi);
-      b.ps = Math.round((a + Math.random() * (z - a)) * 20) / 20; rolled++;
+      const roll = () => Math.round((a + Math.random() * (z - a)) * 20) / 20;
+      b[key] = roll();
+      rolled++;
     }
   }
   studioSync(); studioCommit(); studioSchedule();
-  if (kind === "lucky") $("stStatus").textContent = `Lucky mix: ${rolled} block(s) rolled, ${lo} to ${hi} (Undo for the mix before; Save preset… to keep it).`;
+  if (kind === "lucky") $("stStatus").textContent = `Lucky mix: ${rolled} slider(s) rolled, ${lo} to ${hi}` +
+    `${S.st.locks.size + S.st.dlocks.size ? `, ${S.st.locks.size + S.st.dlocks.size} locked or frozen slider(s) left alone` : ""} (Undo for the mix before; Freeze tweaked to keep ` +
+    "what you like and roll the rest; Save preset… to keep it).";
   stRemember();
 }
 
@@ -4472,10 +5077,9 @@ function studioPresetSaveOpen() {
 function studioState() {
   const blocks = {};
   for (const [id, b] of Object.entries(S.st.blocks)) blocks[id] = {primary_enabled: b.pe, primary_strength: b.ps, donor_enabled: b.de, donor_strength: b.ds};
-  const res = Number($("stRes").value) || 768;
   const num = (id, d) => { const v = Number($(id).value); return isFinite(v) ? v : d; };
-  return {blocks, seed: seedOf("stSeed"), prompt: $("stPrompt").value.trim(), preview_width: res,
-    preview_height: res, ref_image_path: $("stRefRow").style.display === "none" ? "" : $("stRef").value.trim(),
+  return {blocks, seed: seedOf("stSeed"), prompt: $("stPrompt").value.trim(), preview_width: Number($("stW").value) || 768,
+    preview_height: Number($("stH").value) || 768, ref_image_path: $("stRefRow").style.display === "none" ? "" : $("stRef").value.trim(),
     ref_megapixels: num("stRefMp", 1), ref_strength: num("stRefStr", 1), primary_scale: num("stPScale", 1),
     donor_scale: num("stDScale", 1)};
 }
@@ -4524,6 +5128,10 @@ async function studioPoll() {
   S.st.ready = st.state === "ready";
   S.st.donor = !!st.donor;
   S.st.primaryBlocks = new Set(st.primary_blocks || []); S.st.donorBlocks = new Set(st.donor_blocks || []);
+  // a donor loaded (or unloaded) after the model: its rows and buttons show (or go) now, not at the next load
+  const actKey = [S.st.ready, st.donor || "", (st.primary_blocks || []).length, (st.donor_blocks || []).length].join("|");
+  if (wasReady && S.st.ready && actKey !== S.st.actKey) studioActivity();
+  S.st.actKey = actKey;
   // loaded with nothing to render yet: say what it waits for (a prompt), not that a preview is coming
   const waiting = st.state === "ready" && !st.rendering && !st.shown && !$("stPrompt").value.trim();
   $("stStatus").textContent = (waiting ? "Loaded. Enter a prompt (include the LoRA's trigger word), then press Update." :
@@ -4570,7 +5178,9 @@ async function studioPoll() {
     studioMetrics();
     studioDownloads(st, q);
     const ps = Number($("stPScale").value) || 1;
-    $("stBaseCap").textContent = ps === 1 ? "Baseline (LoRA at default 1.0)" : `Baseline (LoRA at ${ps})`;
+    $("stBaseCap").textContent = (ps === 1 ? "Baseline (LoRA at default 1.0)" : `Baseline (LoRA at ${ps})`) +
+      (st.donor ? " - the donor is not in the baseline" : "");
+    $("stTweakCap").textContent = "Tweaked (current sliders)" + (st.donor ? " - includes the donor" : "");
   }
   studioNoLoraPane(st);
   studioAceNotes(st.notes);
@@ -4611,7 +5221,7 @@ function studioDownloads(st, q) {
 function studioNoLoraPane(st) {
   // the base model's own clip / song, left of the pair (the desktop's player has it there): H3 with the tick, ACE always
   const kind = S.st.layout && S.st.layout.kind;
-  const on = kind === "audio" || (kind === "video" && $("stH3NoLora").checked);
+  const on = kind === "audio";                        // No LoRA: ACE-Step's song only (H3's clip was too slow)
   $("stNolPane").style.display = on && kind === "video" ? "" : "none";     // a song's No LoRA is heard in the player
   $("stPreview").classList.toggle("three", on && kind === "video");
   if (kind === "audio") $("stSongNolora").textContent = st.nolora_busy ? "▶ No LoRA (rendering…)" : "▶ No LoRA";
@@ -4655,10 +5265,133 @@ async function studioSave(overwrite) {
   } catch (e) { $("stSaveMsg").replaceChildren(el("div", {class: "problems", text: e.message})); }
 }
 
+// ---- the preview kept in view: the Preview card's panes moved into a panel that floats (move it, resize it from the
+// corner) or is pinned to the top of the tab (its bottom edge sets the height); renders, clips, songs and Play
+// together keep working because it is the same panes, moved - and put back when it closes
+const ST_DOCK_KEY = "fizgig_studio_dock";
+const stDockSaved = () => { try { return JSON.parse(localStorage.getItem(ST_DOCK_KEY) || "{}"); } catch (e) { return {}; } };
+const stDockSave = (d) => { try { localStorage.setItem(ST_DOCK_KEY, JSON.stringify({...stDockSaved(), ...d})); } catch (e) { /* private window */ } };
+
+function studioDockClamp(dock) {                   // a floating panel stays on screen (a smaller window, a phone)
+  const r = dock.getBoundingClientRect(), vw = window.innerWidth, vh = window.innerHeight;
+  const w = Math.min(r.width, vw - 16), h = Math.min(r.height, vh - 16);
+  dock.style.width = w + "px"; dock.style.height = dock.classList.contains("collapsed") ? "" : h + "px";
+  dock.style.left = Math.max(8, Math.min(r.left, vw - w - 8)) + "px";
+  dock.style.top = Math.max(8, Math.min(r.top, vh - 40)) + "px";
+}
+
+function studioDockMode(pinned) {
+  const dock = $("stDock"), sv = stDockSaved();
+  dock.classList.toggle("pinned", pinned); dock.classList.toggle("floating", !pinned);
+  $("stDockPin").textContent = pinned ? "⧉ Float" : "📌 Pin to top";
+  $("stDockPin").title = pinned ? "Float the panel: move it anywhere and resize it from its corner" :
+    "Lock the panel to the top of the tab, full width; drag its bottom edge to set how much room it takes";
+  if (pinned) {                                    // in the tab's flow, stuck to the top as the page scrolls under it
+    $("tab-studio").prepend(dock);
+    Object.assign(dock.style, {left: "", top: "", width: "", height: (sv.pinH || 320) + "px"});
+  } else {                                         // inside the tab too: it goes whenever the tab does
+    $("tab-studio").append(dock);
+    const w = sv.w || Math.min(560, window.innerWidth - 32), h = sv.h || 340;
+    Object.assign(dock.style, {width: w + "px", height: h + "px",
+      left: (sv.x ?? window.innerWidth - w - 24) + "px", top: (sv.y ?? 90) + "px"});
+    studioDockClamp(dock);
+  }
+  if (sv.collapsed) dock.style.height = "";
+  stDockSave({pinned});
+}
+
+const studioDockAllowed = () => !(S.st.layout && S.st.layout.kind === "audio");     // never for a music model
+
+function studioDock(open, remember = true) {
+  let dock = $("stDock");
+  if (!open) {
+    if (dock) {
+      $("stDockHome").after($("stPreview"));
+      dock.remove();
+    }
+    $("stDockHome").style.display = "none"; $("stDockOpen").style.display = studioDockAllowed() ? "" : "none";
+    if (remember) stDockSave({open: false});
+    return;
+  }
+  if (!studioDockAllowed()) return;
+  if (!dock) {
+    const btn = (id, text, title) => el("button", {class: "btn btn-sm", id, text, title});
+    dock = el("div", {class: "st-dock", id: "stDock"},
+      el("div", {class: "st-dock-bar", id: "stDockBar"}, el("span", {class: "st-dock-title", text: "Preview"}),
+        btn("stDockPlay", "▶ Play together", "Play the clips or songs together"),
+        btn("stDockPin", "", ""), btn("stDockFold", "▁", "Collapse to the title bar / open it again"),
+        btn("stDockClose", "✕", "Close - the preview goes back to its card")),
+      el("div", {class: "st-dock-body", id: "stDockBody"}),
+      el("div", {class: "st-dock-grip", id: "stDockGrip", title: "Drag to set how much room the panel takes"}));
+    $("tab-studio").append(dock);                  // in the page first: its buttons are found by id below
+    $("stDockClose").addEventListener("click", () => studioDock(false));
+    $("stDockPin").addEventListener("click", () => studioDockMode(!dock.classList.contains("pinned")));
+    $("stDockPlay").addEventListener("click", () => $("stPlayBothBtn").click());
+    $("stDockFold").addEventListener("click", () => {
+      const c = !dock.classList.contains("collapsed");
+      dock.classList.toggle("collapsed", c); stDockSave({collapsed: c});
+      const sv = stDockSaved();
+      dock.style.height = c ? "" : (dock.classList.contains("pinned") ? (sv.pinH || 320) : (sv.h || 340)) + "px";
+    });
+    // floating: drag by the title bar
+    $("stDockBar").addEventListener("pointerdown", (e) => {
+      if (!dock.classList.contains("floating") || e.target.closest("button")) return;
+      const r = dock.getBoundingClientRect(), dx = e.clientX - r.left, dy = e.clientY - r.top;
+      $("stDockBar").setPointerCapture(e.pointerId);
+      const move = (m) => { dock.style.left = (m.clientX - dx) + "px"; dock.style.top = (m.clientY - dy) + "px"; };
+      const up = () => { $("stDockBar").removeEventListener("pointermove", move); studioDockClamp(dock);
+        const q = dock.getBoundingClientRect(); stDockSave({x: Math.round(q.left), y: Math.round(q.top)}); };
+      $("stDockBar").addEventListener("pointermove", move);
+      $("stDockBar").addEventListener("pointerup", up, {once: true});
+    });
+    // pinned: drag the bottom edge for the height
+    $("stDockGrip").addEventListener("pointerdown", (e) => {
+      if (!dock.classList.contains("pinned")) return;
+      const y0 = e.clientY, h0 = dock.getBoundingClientRect().height;
+      $("stDockGrip").setPointerCapture(e.pointerId);
+      const move = (m) => { dock.style.height = Math.max(140, Math.min(window.innerHeight * 0.85, h0 + m.clientY - y0)) + "px"; };
+      const up = () => { $("stDockGrip").removeEventListener("pointermove", move);
+        stDockSave({pinH: Math.round(dock.getBoundingClientRect().height)}); };
+      $("stDockGrip").addEventListener("pointermove", move);
+      $("stDockGrip").addEventListener("pointerup", up, {once: true});
+    });
+    // while the panel is being resized its clips step aside (scaling playing video every frame is the slow part),
+    // back a moment after the size stops changing - the pinned edge drag and the floating corner alike
+    let sizing = null;
+    new ResizeObserver(() => {
+      if (!dock.isConnected) return;
+      dock.classList.add("st-resizing");
+      clearTimeout(sizing);
+      sizing = setTimeout(() => dock.classList.remove("st-resizing"), 200);
+    }).observe(dock);
+    // floating: the corner resize is the browser's own; its size is remembered
+    new ResizeObserver(debounce(() => {
+      if (dock.isConnected && dock.classList.contains("floating") && !dock.classList.contains("collapsed")) {
+        const q = dock.getBoundingClientRect(); stDockSave({w: Math.round(q.width), h: Math.round(q.height)});
+      }
+    }, 300)).observe(dock);
+  }
+  $("stDockBody").append($("stPreview"));
+  $("stDockHome").style.display = ""; $("stDockOpen").style.display = "none";
+  const sv = stDockSaved();
+  dock.classList.toggle("collapsed", !!sv.collapsed);
+  studioDockMode(!!sv.pinned);
+  studioDockPlay();
+  stDockSave({open: true});
+}
+
+function studioDockPlay() {                        // the panel's Play together: when the card has one (clips, songs)
+  if ($("stDockPlay")) $("stDockPlay").style.display = $("stPlayBoth").style.display === "none" ? "none" : "";
+}
+
 function wireStudio() {
+  $("stDockOpen").addEventListener("click", () => studioDock(true));
+  $("stDockBack").addEventListener("click", () => studioDock(false));
+  new MutationObserver(studioDockPlay).observe($("stPlayBoth"), {attributes: true, attributeFilter: ["style"]});
+  window.addEventListener("resize", debounce(() => { const d = $("stDock"); if (d && d.classList.contains("floating")) studioDockClamp(d); }, 150));
   $("stFamily").addEventListener("change", () => { studioFamily(); stRemember(); });
   // H3: a length / size / steps / sound change renders; Model and Base take effect at the next Start
-  for (const id of ["stH3Len", "stH3W", "stH3H", "stH3Scale", "stH3Steps", "stH3Turbo", "stH3Sound", "stH3NoLora"])
+  for (const id of ["stH3Len", "stH3W", "stH3H", "stH3Steps", "stH3Turbo", "stH3Sound", "stH3Boost"])
     $(id).addEventListener("change", () => { studioH3Remember(); studioSchedule(); });
   $("stH3Early").addEventListener("change", studioH3Remember);
   $("stH3Model").addEventListener("change", () => { studioH3Remember(); studioSlots(); $("stStart").textContent = "Update"; });
@@ -4686,9 +5419,13 @@ function wireStudio() {
   $("stRefPick").addEventListener("click", () => pick($("stRef").value || refStart(), false, (p) => { $("stRef").value = p; stRemember(); studioSchedule(); }));
   $("stRefClear").addEventListener("click", () => { $("stRef").value = ""; stRemember(); studioSchedule(); });
   $("stSeedNew").addEventListener("click", () => { $("stSeed").value = 1 + Math.floor(Math.random() * 99999); stRemember(); studioSchedule(); });
-  for (const id of ["stSeed", "stRes", "stRefMp", "stRefStr", "stPScale", "stDScale"])
+  for (const id of ["stSeed", "stRes", "stW", "stH", "stRefMp", "stRefStr", "stPScale", "stDScale"])
     $(id).addEventListener("change", () => { stRemember(); studioSchedule(); });
   for (const id of ["stPrompt", "stPrimary", "stDonor", "stLuckyLo", "stLuckyHi"]) $(id).addEventListener("input", stRemember);
+  $("stLuckyWho").addEventListener("change", () => { stRemember(); studioFreezeState(); });
+  $("stLuckyCount").addEventListener("change", stRemember);
+  $("stFreeze").addEventListener("click", () => studioFreeze(true));
+  $("stUnfreeze").addEventListener("click", () => studioFreeze(false));
   $("stNeg").addEventListener("change", () => { stRemember();
     if (S.st.ready) api("/api/studio/settings", {family: S.st.layout.key, negative: $("stNeg").value.trim()}).then(() => studioSchedule()); });
   $("stTurbo").addEventListener("change", () => { stRemember(); if (S.st.ready) api("/api/studio/settings", {family: S.st.layout.key, turbo: $("stTurbo").checked}); });
@@ -4812,7 +5549,7 @@ async function capRun(path, body) {
 // while captioning runs: the captions written so far fill in every few seconds - never over one you're editing
 async function captionsLive() {
   if (!S.imageFolder || !document.querySelector("#tab-captions.active")) return;
-  const r = await api(`/api/captions?folder=${encodeURIComponent(S.imageFolder)}&ext=${encodeURIComponent(capExt())}`)
+  const r = await api(`/api/captions?folder=${encodeURIComponent(S.imageFolder)}&ext=${encodeURIComponent(capExt())}&family=${encodeURIComponent(S.family || "")}`)
     .catch(() => null);
   if (!r || !r.items) return;
   const now = new Map(r.items.map((i) => [i.name, i]));
@@ -4880,7 +5617,7 @@ async function loadCaptions() {
     "Choose the training folder on the Start tab first.";
   if (!S.imageFolder) { $("captionsSummary").textContent = "Choose the training folder on the Start tab."; return; }
   const ext = $("captionExt").value.trim() || ".txt";
-  const r = await api(`/api/captions?folder=${encodeURIComponent(S.imageFolder)}&ext=${encodeURIComponent(ext)}`);
+  const r = await api(`/api/captions?folder=${encodeURIComponent(S.imageFolder)}&ext=${encodeURIComponent(ext)}&family=${encodeURIComponent(S.family || "")}`);
   S.cap.items = r.items;
   renderCaptions();
 }
@@ -5583,16 +6320,50 @@ async function browse(path) {
   places.innerHTML = "";
   for (const p of r.places || []) places.append(el("button", {class: "btn btn-sm", text: p.name, title: p.path,
     onclick: () => browse(p.path)}));
+  S.pickListing = r;
+  $("pickerFilter").value = "";
+  pickerRender();
+}
+
+// the picker's list: folders first, then files, sorted by the chosen column (remembered), filtered by name
+const pickSort = {key: "name", desc: false};
+try { Object.assign(pickSort, JSON.parse(localStorage.getItem("fizgig.pickSort") || "{}")); } catch (e) { /* none saved */ }
+function pickerRender() {
+  const r = S.pickListing;
+  if (!r) return;
+  const q = $("pickerFilter").value.trim().toLowerCase();
+  const ext = (n) => (n.includes(".") ? n.slice(n.lastIndexOf(".") + 1) : "").toLowerCase();
+  const cmpName = (a, b) => a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: "base"});
+  const k = pickSort.key;
+  const cmp = (a, b) => {
+    let c = k === "name" ? 0 : k === "type" ? ext(a.name).localeCompare(ext(b.name)) : (a[k] ?? -1) - (b[k] ?? -1);
+    c = c || cmpName(a, b);
+    return pickSort.desc ? -c : c;
+  };
+  const when = (t) => t ? new Date(t * 1000).toLocaleString([], {year: "numeric", month: "short", day: "numeric",
+    hour: "2-digit", minute: "2-digit"}) : "";
+  const size = (n) => n == null ? "" : n < 1024 ? n + " B" : n < 2 ** 20 ? (n / 1024).toFixed(0) + " KB"
+    : n < 2 ** 30 ? (n / 2 ** 20).toFixed(1) + " MB" : (n / 2 ** 30).toFixed(2) + " GB";
+  const shown = (xs) => xs.filter((x) => !q || x.name.toLowerCase().includes(q)).sort(cmp);
+  const row = (x, dir, go) => el("div", {class: "picker-item" + (dir ? " dir" : ""), title: x.path, onclick: go}, [
+    el("span", {text: (dir ? "📁 " : "") + x.name}), el("span", {class: "m", text: when(k === "ctime" ? x.ctime : x.mtime)}),
+    el("span", {class: "z", text: dir ? "" : size(x.size)})]);
   const list = $("pickerList");
-  list.innerHTML = "";
-  for (const d of r.dirs) list.append(el("div", {class: "picker-item dir", text: "📁 " + d.name, onclick: () => browse(d.path)}));
-  if (!pickDir) {
-    for (const f of r.files) {
-      list.append(el("div", {class: "picker-item", text: f.name, onclick: () => {
-        $("pickerModal").classList.remove("active"); pickDone(f.path);
-      }}));
-    }
+  list.replaceChildren(...shown(r.dirs).map((d) => row(d, true, () => browse(d.path))),
+    ...(pickDir ? [] : shown(r.files).map((f) => row(f, false, () => { $("pickerModal").classList.remove("active"); pickDone(f.path); }))));
+  $("pickerSort").value = k;
+  $("pickerDir").textContent = pickSort.desc ? "↓" : "↑";
+  for (const h of document.querySelectorAll(".picker-head span")) {
+    h.classList.toggle("on", h.dataset.sort === k || (k === "ctime" && h.dataset.sort === "mtime"));
+    h.classList.toggle("desc", pickSort.desc);
   }
+  document.querySelector('.picker-head span[data-sort="mtime"]').textContent = k === "ctime" ? "Date created" : "Date modified";
+}
+function pickerSortBy(key, flip) {
+  if (flip && pickSort.key === key) pickSort.desc = !pickSort.desc;
+  else { pickSort.key = key; pickSort.desc = key !== "name" && key !== "type"; }   // dates and sizes: newest / biggest first
+  try { localStorage.setItem("fizgig.pickSort", JSON.stringify(pickSort)); } catch (e) { /* private window */ }
+  pickerRender();
 }
 
 // ---- Open on your phone: a QR code with a one-time pass (the server's /api/phone_link). It shows for 30 s when asked
@@ -5670,7 +6441,8 @@ function phoneCard() {
 // ---- a pod's file manager (port 8080): the sidebar button, the Start tab's upload card, Runs & outputs ---------
 function fileManagerLinks(fm) {
   const how = !fm ? "" : fm.login === "none" ? "Its login isn't set up: it refuses this pod's password as too common. " +
-    "Give the pod a less common FIZGIG_PASSWORD (Edit pod on RunPod) and restart it" :
+    "Give it a less common FIZGIG_PASSWORD (on RunPod: Edit pod, then restart it; on Vast.ai: rent a new instance " +
+    "with it set)" :
     "Log in as admin with this pod's password" + (fm.login === "padded" ? ", with 0s added to make it 12 characters " +
     "(the file manager refused it as too common): abc123 → abc123000000. The pod's log shows it" : "");
   $("sideFiles").style.display = fm ? "" : "none";
@@ -5686,6 +6458,7 @@ S.pods = {list: [], timer: 0, waitFor: ""};
 const inApp = () => !!window.pywebview;
 const POD_STATE = {ready: ["Ready", "ok"], waiting: ["Starting - a pod can take a few minutes. If it isn't ready after that, check it on RunPod", "warn"],
   stopped: ["Stopped", "muted"], off: ["Not answering", "muted"], starting: ["Starting...", "warn"],
+  gone: ["Deleted on RunPod: it isn't on your account any more. Forget takes it off this list", "muted"],
   away: ["Not on your network now: is it on, awake and running Fizgig?", "muted"],
   blocked: ["Found, but it doesn't let this computer in yet: on it, Preferences > Web UI > Allow on my network", "warn"]};
 
@@ -6198,7 +6971,7 @@ function uploadButton(r, input, set) {
   const status = el("div", {class: "field-hint upload-status"});
   const say = (t, bad) => { status.textContent = t; status.classList.toggle("bad", !!bad); };
   const picker = r.kind === "folder" ? el("input", {type: "file", webkitdirectory: true, hidden: true}) :
-    el("input", {type: "file", hidden: true, accept: ".safetensors,image/*,.mp4,audio/*,.m4a"});
+    el("input", {type: "file", hidden: true, accept: r.accept || ".safetensors,image/*,.mp4,audio/*,.m4a"});
   picker.addEventListener("change", async () => {
     const files = [...picker.files];
     picker.value = "";
@@ -6259,6 +7032,8 @@ function lightboxShow(i) {
   }
   $("lightboxImg").src = pic.src;
   $("lightboxName").textContent = pic.name;
+  $("lightboxMode").textContent = pic.mode || "";
+  $("lightboxMode").style.display = pic.mode ? "" : "none";
   $("lightboxPrev").style.visibility = i > 0 ? "" : "hidden";
   $("lightboxNext").style.visibility = i < S.lb.list.length - 1 ? "" : "hidden";
   $("lightbox").style.display = "";
@@ -6283,12 +7058,14 @@ function wireLightbox() {
     const img = e.target.closest && e.target.closest(LIGHTBOX_PICS);
     if (!img) return;
     const host = img.closest(".gallery, .captions-grid, .st-preview") || document;   // step through the pictures beside it
-    const imgs = [...host.querySelectorAll(LIGHTBOX_PICS)];
+    const imgs = [...host.querySelectorAll(LIGHTBOX_PICS)]       // only the pictures on show (a hidden pane is not one)
+      .filter((i) => i === img || (i.getClientRects().length && (i.currentSrc || i.getAttribute("src"))));
     S.lb.list = imgs.map((i) => {
       const fig = i.closest(".gallery-item, .caption-card");
       const cap = fig && fig.querySelector("figcaption, .caption-card-title");
       const label = cap ? [...cap.childNodes].map((n) => n.textContent).filter(Boolean).join(" · ") : "";
-      return {src: fullPicture(i.currentSrc || i.src), name: label || i.alt, cap: fig && fig._cap};
+      return {src: fullPicture(i.currentSrc || i.src), name: label || i.alt, cap: fig && fig._cap,
+              mode: (fig && fig._mode) || ""};
     });
     lightboxShow(imgs.indexOf(img));
   });
@@ -6358,6 +7135,14 @@ function wire() {
   wireStudio();
   wirePrep();
   $("presetSave").addEventListener("click", presetSaveOpen);
+  $("btnImageLoss").addEventListener("click", async () => {      // the same view as Runs & outputs, for the run going now
+    const box = $("runImageLoss"), id = S.run && S.run.history_id;
+    if (!id) return;
+    if (box.style.display !== "none") { box.style.display = "none"; return; }
+    box.style.display = ""; box.textContent = "Loading…";
+    try { imageLossPanel(box, await api("/api/runs/image_loss?id=" + encodeURIComponent(id)), {...S.run, id}); }
+    catch (e) { box.replaceChildren(el("div", {class: "problems", text: e.message})); }
+  });
   document.querySelectorAll(".tab-item").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
   document.querySelectorAll("[data-goto]").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.goto)));
   // the sidebar's run opens the run card itself (it sits under the Training form)
@@ -6368,7 +7153,11 @@ function wire() {
   for (const sel of document.querySelectorAll(".family-pick"))
     sel.addEventListener("change", (e) => chooseFamily(e.target.value));
   const folder = $("imageFolder");
-  const setFolder = () => { S.imageFolder = folder.value.trim(); loadTrigger(); refreshStateSoon(); saveStateSoon(); };
+  const setFolder = () => {
+    const was = S.imageFolder;
+    S.imageFolder = folder.value.trim(); loadTrigger(); refreshStateSoon(); saveStateSoon();
+    if (S.imageFolder !== was) lookForget();
+  };
   folder.addEventListener("change", setFolder);
   $("uploadFiles").addEventListener("change", (e) => { uploadFiles([...e.target.files]); e.target.value = ""; });
   $("uploadDir").addEventListener("change", (e) => {
@@ -6413,6 +7202,11 @@ function wire() {
     finally { $("pickerUpload").classList.remove("disabled"); }
   });
   $("pickerPath").addEventListener("change", (e) => browse(e.target.value));
+  $("pickerFilter").addEventListener("input", pickerRender);
+  $("pickerSort").addEventListener("change", (e) => pickerSortBy(e.target.value, false));
+  $("pickerDir").addEventListener("click", () => pickerSortBy(pickSort.key, true));
+  for (const h of document.querySelectorAll(".picker-head span"))
+    h.addEventListener("click", () => pickerSortBy(h.dataset.sort === "mtime" && pickSort.key === "ctime" ? "ctime" : h.dataset.sort, true));
   // New folder: made in the folder on show, then opened (Use this folder picks it)
   const newRow = (on) => { $("pickerNewRow").style.display = on ? "" : "none"; if (on) $("pickerNewName").focus(); };
   $("pickerNew").addEventListener("click", () => { $("pickerNewMsg").textContent = ""; $("pickerNewName").value = ""; newRow(true); });

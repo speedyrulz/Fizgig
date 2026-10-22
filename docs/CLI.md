@@ -33,9 +33,11 @@ Every script supports `--help` for the full argument list. This document covers 
 - [Preparing images and captions](#preparing-images-and-captions)
 - [Klein 9B training](#klein-9b-training)
 - [Flux 3 Image Klein training](#flux-3-image-klein-training)
+- [MOSS-Image training](#moss-image-training)
 - [Krea 2 training](#krea-2-training)
 - [MiniMax H3 training](#minimax-h3-training)
 - [Qwen Image 2.1 training](#qwen-image-21-training)
+- [Keeping a subject to its trigger (DOP)](#keeping-a-subject-to-its-trigger-dop)
 - [Sample previews during training](#sample-previews-during-training)
 - [Pause and resume](#pause-and-resume)
 - [VRAM guidance (block swap)](#vram-guidance-block-swap)
@@ -69,6 +71,16 @@ Headless, there is no Preferences tab: **model locations are passed as flags on 
 | Distilled DiT `flux3_image_klein_sd_bf16.safetensors` | diffusion_models/ | 16-step previews (`--preview_checkpoint`) and the workbench tabs |
 | Autoencoder `flux2-vae.safetensors` | vae/ | `--vae` (cache step: `--model`) |
 | Text encoder `qwen3vl_4b_bf16.safetensors` | text_encoders/ | `--text_encoder` (cache step: `--model`) |
+
+**MOSS-Image** (none gated):
+
+| File | Download | Used for |
+|---|---|---|
+| Base DiT `moss_image_base_bf16.safetensors` | [Comfy-Org/MOSS-Image → diffusion_models](https://huggingface.co/Comfy-Org/MOSS-Image/tree/main/diffusion_models) | training (`--dit`); quantised to INT8 or NF4 at load when `--precision` asks |
+| Autoencoder `flux2-vae_small.safetensors` | [Comfy-Org/MOSS-Image → vae](https://huggingface.co/Comfy-Org/MOSS-Image/tree/main/vae): FLUX.2's encoder with the small decoder MOSS-Image ships with (Flux 3's `flux2-vae.safetensors` works too) | `--vae` (cache step: `--model`) |
+| SFT DiT `moss_image_sft_int8_convrot.safetensors` (optional) | [Comfy-Org/MOSS-Image → diffusion_models](https://huggingface.co/Comfy-Org/MOSS-Image/tree/main/diffusion_models) | previews on the SFT model (`--preview_checkpoint`) |
+| Turbo LoRA `8-steps-dmd-lora.safetensors` (optional) | [lodestones/Kromoss](https://huggingface.co/lodestones/Kromoss/blob/main/8-steps-dmd-lora.safetensors) | fast previews (`--speed_lora`, with `--sample_steps 12 --sample_cfg_scale 1`) on the Base, never on SFT |
+| Text encoder `qwen3.5_9b_bf16.safetensors` | [Comfy-Org/Qwen3.5 → text_encoders](https://huggingface.co/Comfy-Org/Qwen3.5/tree/main/text_encoders) | `--text_encoder` (cache step: `--model`) |
 
 **Krea 2:**
 
@@ -110,7 +122,7 @@ The quickest way to get every file is the fetcher the Preferences download butto
 
 ## What's family-specific at a glance
 
-Every family trains through the same two scripts — `src/fizgig/families/cache.py` and `src/fizgig/families/train.py`, selected with `--family` (`klein`, `flux3`, `minimax`, `krea2`, `qwen_image21`) — and shares the dataset format, pause/resume, Context LoRA, LoKR, sliders, fine-tuning and the memory planner. What differs:
+Every family trains through the same two scripts — `src/fizgig/families/cache.py` and `src/fizgig/families/train.py`, selected with `--family` (`klein`, `flux3`, `minimax`, `krea2`, `qwen_image21`, `moss_image`) — and shares the dataset format, pause/resume, Context LoRA, LoKR, sliders, fine-tuning and the memory planner. What differs:
 
 | Feature | Klein 9B | Flux 3 Image Klein | MiniMax H3 | Krea 2 | Qwen Image 2.1 |
 |---|---|---|---|---|---|
@@ -192,8 +204,11 @@ Field notes:
 - **`num_repeats`** — multiplies how often each image appears per epoch. Leave at 1 and train more epochs instead, unless you're balancing multiple `[[datasets]]` blocks against each other.
 - **`cache_directory`** — where latents and text embeddings are stored. **Give every dataset its own cache directory.** The training set is built from the cache, and a shared cache directory can mix a previous dataset's images into your run. (Fizgig cross-checks the cache against `image_directory` and skips orphans with a warning, but a dedicated directory per dataset is the clean way.)
 - **Multiple `[[datasets]]` blocks** are supported — each with its own `image_directory`, `cache_directory`, and optional per-dataset overrides of any `[general]` key (e.g. a different `num_repeats` to weight one folder more heavily).
+- **`caption_replace = [["zwxem, a woman", "zwxemwoman"]]`** — rewrites captions as they're read (whole words, any case, in order); your `.txt` files aren't changed. Fizgig LoRA Isolation uses it to join each trigger to its class.
+- **`photos_only = true`** — a family that trains clips or voice (MiniMax H3) reads only the pictures in this folder. Fizgig LoRA Isolation sets it on H3, which trains people from their photos.
+- **`is_reg = true`** — marks a fine-tune's regularisation set: those images train at `--reg_lr_multiplier` (default 0.2) times the learning rate, as a light anchor on the class. A LoRA run trains such a block as ordinary images and says so in the log.
 
-If you change captions, re-run the text cache step. If you add/remove/edit images, re-run both cache steps.
+If you change captions, re-run the text cache step. If you add/remove/edit images, re-run both cache steps (a picture edited after it was cached is encoded again even with `--skip_existing`).
 
 ---
 
@@ -340,6 +355,46 @@ The saved LoRA loads in ComfyUI's standard LoRA loader.
 
 ---
 
+## MOSS-Image training
+
+MOSS-Image trains through the shared cache script and trainer with `--family moss_image`. You need the three files from the [download table](#model-files-where-they-come-from-where-they-go); the dataset TOML is the same as the other families'. Previews run res_multistep for 30 steps with CFG 4. The LoRA trains every Linear in all 42 blocks, block 22 included; with MOSS-Image SFT or a fine-tune of it as `--dit`, add `--family_option lora_sft=1` so it trains attention only (the GUI's Train attention only; it also lowers a fine-tune's VRAM on Base, at a possible cost in quality). `--family_option lownoise_pct=40` sets the clean-end share (a single value; leave it out for the model's own schedule, about 11%); `lownoise_pct=60:7:30:15:2` is the GUI's Slide (the default), 60% until epoch 7, then down in a straight line to 30% by epoch 15, and every 2nd epoch after that one epoch at 60% (leave off `:2` for none); `lownoise_pct=75:5:40` drops at once, 75% for the first 5 epochs, then 40%. Train on the Base: a LoRA trained on Kromoss began to overbake after about 750 steps in our test. With SFT as `--preview_checkpoint`, `--speed_lora` (the Turbo LoRA) is left out of the previews; it joins previews on the Base.
+
+### Full example
+
+The **Fast** preset, as the GUI's planner builds it: rank 16, 0.25 MP (`resolution = [512, 512]` in the TOML), LR 1e-4, 70 epochs, clean-end share Slide (60% until epoch 7, then down to 30% by epoch 15, every 2nd epoch after at 60%):
+
+```bash
+python src/fizgig/families/cache.py --family moss_image --stage latents --dataset_config my_dataset.toml --model /models/flux2-vae_small.safetensors
+python src/fizgig/families/cache.py --family moss_image --stage text    --dataset_config my_dataset.toml --model /models/qwen3.5_9b_bf16.safetensors
+
+python src/fizgig/families/train.py \
+  --family moss_image \
+  --dataset_config my_dataset.toml \
+  --dit /models/moss_image_base_bf16.safetensors \
+  --output_dir ./output_loras/my_subject \
+  --output_name my_subject \
+  --network_dim 16 --network_alpha 16 \
+  --learning_rate 1e-4 \
+  --max_train_epochs 70 \
+  --save_every_n_epochs 1 \
+  --seed 42 \
+  --optimizer_type adamw \
+  --precision auto --compile_blocks auto \
+  --ema_decay 0.98 \
+  --family_option lownoise_pct=60:7:30:15:2 \
+  --save_state --save_state_on_train_end --keep_last_n_states 2 \
+  --vae /models/flux2-vae_small.safetensors \
+  --text_encoder /models/qwen3.5_9b_bf16.safetensors \
+  --sample_prompts sample_prompts.txt \
+  --sample_every_n_epochs 1 \
+  --sample_width 1024 --sample_height 1024 --sample_steps 30 --sample_cfg_scale 4.0 \
+  --sample_negative "worst quality, bad anatomy, watermark, jpeg artifact"
+```
+
+See [MOSS-Image](MOSS_IMAGE.md) for the presets and preview settings.
+
+---
+
 ## Krea 2 training
 
 Krea 2 (12.9B) trains through Fizgig's driver system — the same cache script and trainer as Qwen Image 2.1 (`src/fizgig/families/`), selected with `--family krea2` — and is the home of the intelligent-trainer features: the per-image loss watch, auto-recaptioning, per-image adaptive LR and look-outlier warm-up started here. You need the files from the [download table](#model-files-where-they-come-from-where-they-go): the RAW DiT for training, the Qwen-Image VAE, the Qwen3-VL-4B text encoder (which doubles as the vision model for auto-recaptioning), and the Turbo LoRA for 8-step previews.
@@ -397,7 +452,8 @@ The non-obvious flags (`--help` lists them all):
 - `--compile_blocks auto|on|outside|off` — torch.compile the transformer blocks (`outside` = the high-resolution boundary: checkpoint kept outside the compiled region, eager-level memory, chosen automatically by `auto`/`on` where inside-the-graph would not fit): roughly **2× faster steady-state steps** on the INT8 path after a one-off warm-up (~90 s + a pause on each new latent shape). `auto` (default) weighs the warm-up against the run length and only compiles when it pays. Needs triton (installs with requirements; `triton-windows` on Windows) and, on Windows, the MSVC C++ Build Tools — direct installer: https://aka.ms/vs/17/release/vs_BuildTools.exe ("Desktop development with C++" workload). Missing either → a console note and the run continues uncompiled.
 - `--ema_decay 0.98` — weight averaging: checkpoints and previews come from a smoothed average of the weights. `0` (the CLI default) turns it off.
 - `--min_timestep` / `--max_timestep` — restrict training to a noise band, on a 0-1 scale.
-- `--speed_lora FILE` — the Turbo LoRA, attached for 8-step previews on the training model and absent from the saved LoRA; `--speed_lora_strength` defaults to 1.
+- `--preview_lora FILE` — a LoRA on previews of the training model only, never in training (MOSS-Image's SFT look LoRA, `--preview_lora_strength 1.5`); on CPU between previews, and a file that isn't there yet is picked up at a later preview.
+- `--speed_lora FILE` — the Turbo LoRA, attached for 8-step previews on the training model and absent from the saved LoRA; `--speed_lora_strength` defaults to 1; `0` renders previews without it until a live preview change asks for a strength, when it loads at the next preview.
 
 **The per-image loss watch** (any of these enables the watcher)
 
@@ -551,13 +607,35 @@ The other two presets change only a few flags. **Standard** is `--network_dim 16
 
 ---
 
+## Keeping a subject to its trigger (DOP)
+
+Every family, Standard LoRA and fine-tune runs. `--dop` adds a second pass to each step: the same picture, with the caption's trigger swapped for `--dop_class` (or dropped when that is empty), trained to match what the base model itself predicts there. Without the trigger the LoRA learns to change nothing, so the subject stops leaking into plain prompts ("a woman ..."). It costs about 1.5-2x the time per step. Differential Output Preservation comes from Ostris's AI-Toolkit.
+
+| Flag | Meaning |
+|---|---|
+| `--dop` | turn it on (needs `--text_encoder`: the swapped captions are encoded once at the start) |
+| `--dop_trigger zwxem` | the word in the captions that means the subject; several subjects comma-separated (`zwxem, qrtpl`). Default `--trigger_word` |
+| `--dop_class woman` | what replaces each trigger: one per trigger in order (`woman, man`) or one for all; empty = the triggers are just left out |
+| `--dop_weight 1.0` | the preservation loss's weight |
+| `--dop_every 1` | a preservation pass every N steps; raise `--dop_weight` by the same factor to keep the same preservation on average (the web UI's "Every second step" sends `--dop_every 2` with the weight doubled) |
+| `--dop_ft_samples 8` | fine-tunes only: how many of the original model's predictions are made per image before the first step (a fine-tune has no adapter to switch off, so these stand in for the base model; saved beside the run so a continued fine-tune reuses them) |
+
+A caption with several triggers (a photo of both people) has each one swapped. Images whose caption has no trigger train as usual. Each epoch logs the preservation loss: how far the LoRA moves the trigger-free prompt from the base model.
+
+The web app's **Subjects** card always uses the tested recipe, `--dop --dop_every 2 --dop_weight 2`. **Fizgig LoRA Isolation** adds three things, which the launch builds for you:
+- each subject's 16 side-by-side pictures, built first by `src/fizgig/scripts/multi_person.py --subject FOLDER FUSED_WORD OUT_DIR` (one `--subject` per person) and trained as one more dataset block per subject;
+- `--lr_boost fizgig_mp_=2`, so those pictures train at 2x the learning rate;
+- a `caption_replace` list in each subject's dataset block, which reads `zwxem, a woman` as `zwxemwoman`, with `--dop_trigger zwxemwoman --dop_class "a woman"`.
+
+How to caption for it: [People in group pictures](MULTI_PERSON.md).
+
 ## Sample previews during training
 
 `--sample_prompts` takes a text file, one plain prompt per line, `#` lines are comments; geometry and seed come from `--sample_width` / `--sample_height` / `--sample_seed`.
 
 **Klein** renders previews on the Distilled model (4-step, fast, matches ComfyUI) with `--preview_checkpoint <distilled>`; without it they render on the training Base, where `--sample_cfg_scale` (4.5 by default; 1.0 disables CFG) and `--sample_negative` steer them. `--sample_reference FILE` makes every preview an edit of that photo.
 
-**Krea 2** and **Qwen Image 2.1** prompt files are plain prompts only; geometry and seed come from `--sample_width` / `--sample_height` / `--sample_seed`, and previews render on the training model, with the speed LoRA when `--speed_lora` is given (`--sample_steps`: 8 for Krea's Turbo LoRA, 6 for Qwen's). `--sample_cfg_scale` above 1 enables CFG on the previews — pair it with `--sample_negative` for a real uncond. `--sample_at_first` renders an epoch-0 preview (base + zero-init LoRA) before training. A reference picture: Krea 2's `--sample_image FILE` feeds it through the Qwen3-VL vision path (generate driven by a reference picture; works even with an empty prompt file), and Qwen's `--sample_reference FILE` makes every preview an edit of that photo. `--metadata_title/author/description/license/tags` are recorded in the saved LoRA as `modelspec.*` keys.
+**Krea 2** and **Qwen Image 2.1** prompt files are plain prompts only; geometry and seed come from `--sample_width` / `--sample_height` / `--sample_seed`, and previews render on the training model, with the speed LoRA when `--speed_lora` is given (`--sample_steps`: 8 for Krea's Turbo LoRA, 6 for Qwen's). `--sample_cfg_scale` above 1 enables CFG on the previews — pair it with `--sample_negative` for a real uncond. `--sample_at_first` renders an epoch-0 preview (base + zero-init LoRA) before training. `--sample_until_epoch Y --sample_every_n_epochs_after Z` previews every `--sample_every_n_epochs` up to and including epoch Y, then on whole multiples of Z (1 / 10 / 5: epochs 1-10, then 15, 20, 25). `--save_until_epoch Y --save_every_n_epochs_after Z` does the same for checkpoints (not for a fine-tune, which saves at whole rotations). A reference picture: Krea 2's `--sample_image FILE` feeds it through the Qwen3-VL vision path (generate driven by a reference picture; works even with an empty prompt file), and Qwen's `--sample_reference FILE` makes every preview an edit of that photo. `--metadata_title/author/description/license/tags` are recorded in the saved LoRA as `modelspec.*` keys.
 
 **MiniMax H3** prompt files are plain prompts too. Previews are clips: `--sample_frames` sets the length on the model's 17n+5 frame grid (1 = a still, 56 ≈ 2.3 s, 124 = the trained minimum of ~5 s; off-grid values snap down), `--sample_audio` with `--audio_vae` decodes the clip's generated sound to a `.wav` beside the `.mp4`, and `--turbo_lora_path` with `--sample_steps 6` renders on the Turbo LoRA at `--turbo_lora_strength 0.75` (20 steps without it, matching ComfyUI's shipped template). `--sample_width/height` default to H3's native 768. The training adapter is switched off for previews; a Context LoRA stays on. Rendering a 56-frame clip every epoch costs more than the epoch's training on a small dataset — set `--sample_every_n_epochs` higher, or preview stills, when speed is the point.
 

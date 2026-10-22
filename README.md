@@ -1,8 +1,8 @@
-<h1 align="center">Fizgig — LoRA & Fine-tune Studio for Klein 9B, Flux 3 Image Klein, Krea 2, MiniMax H3, Qwen Image 2.1, Z-Image Turbo, SDXL & Anima</h1>
+<h1 align="center">Fizgig — LoRA & Fine-tune Studio for Klein 9B, Flux 3 Image Klein, Krea 2, MiniMax H3, Qwen Image 2.1, MOSS-Image, Z-Image Turbo, SDXL & Anima</h1>
 
 <p align="center">
   <strong>Fine-tune base models on consumer GPUs — down to 8 GB. Fix broken LoRAs without retraining. Find the best epoch by eye.</strong><br>
-  A train · fine-tune · repair · explore workbench built end-to-end for <strong>Flux 2 Klein 9B</strong>, <strong>Flux 3 Image Klein</strong>, <strong>Krea 2</strong>, <strong>MiniMax H3</strong>, <strong>Qwen Image 2.1</strong>, <strong>Z-Image Turbo</strong>, <strong>SDXL</strong> and <strong>Anima</strong> — training on photos, video, sound and voices, from quick LoRAs to the full base model.
+  A train · fine-tune · repair · explore workbench built end-to-end for <strong>Flux 2 Klein 9B</strong>, <strong>Flux 3 Image Klein</strong>, <strong>Krea 2</strong>, <strong>MiniMax H3</strong>, <strong>Qwen Image 2.1</strong>, <strong>MOSS-Image</strong>, <strong>Z-Image Turbo</strong>, <strong>SDXL</strong> and <strong>Anima</strong> — training on photos, video, sound and voices, from quick LoRAs to the full base model.
 </p>
 
 <p align="center">
@@ -26,10 +26,13 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/models-Klein%209B%20%2B%20Flux%203%20Image%20Klein%20%2B%20Krea%202%20%2B%20MiniMax%20H3%20%2B%20Qwen%20Image%202.1%20%2B%20Z--Image%20Turbo%20%2B%20SDXL%20%2B%20Anima%20%2B%20ACE--Step%201.5%20XL-blue?style=for-the-badge" alt="Klein 9B + Flux 3 Image Klein + Krea 2 + MiniMax H3 + Qwen Image 2.1 + Z-Image Turbo + SDXL + Anima + ACE-Step 1.5 XL">
+  <img src="https://img.shields.io/badge/models-Klein%209B%20%2B%20Flux%203%20Image%20Klein%20%2B%20Krea%202%20%2B%20MiniMax%20H3%20%2B%20Qwen%20Image%202.1%20%2B%20MOSS--Image%20%2B%20Z--Image%20Turbo%20%2B%20SDXL%20%2B%20Anima%20%2B%20ACE--Step%201.5%20XL-blue?style=for-the-badge" alt="Klein 9B + Flux 3 Image Klein + Krea 2 + MiniMax H3 + Qwen Image 2.1 + MOSS-Image + Z-Image Turbo + SDXL + Anima + ACE-Step 1.5 XL">
 </p>
 
 > ### 📰 Latest news
+> - **Fizgig 8.8.1 — MOSS-Image likeness sooner, and previews with the SFT look.** A new Clean-end share default, **Slide**, brings likeness in early and keeps it: on our most difficult dataset, the best of eight settings we tried, around 70% likeness from epoch 20 to epoch 60. Base previews can take on much of MOSS-Image SFT's look with no model swap, every enlarged preview says how it was made, and Krea 2's Auto precision no longer picks a slow setup on 16 GB cards. 8.8.2 stops the web UI freezing when you open it during a long run. [Release notes](docs/RELEASE_NOTES_v8.8.1.md) · [8.8.2](docs/RELEASE_NOTES_v8.8.2.md) · [▶ Watch the video](https://www.youtube.com/watch?v=UCoCtM8yrBk) · [MOSS-Image guide](docs/MOSS_IMAGE.md)
+> - **Fizgig 8.5 — MOSS-Image.** OpenMOSS's new 5B open image model trains in Fizgig: LoRAs, LoKRs, sliders, full fine-tuning, Multi Concept and Fizgig LoRA Isolation, with previews on MOSS-Image SFT, the model most people generate with, and every workbench tool. Brought to Fizgig by @Murf-Code. 8.5.1 fixes the GPU readout on AMD cards (thanks @scryptio); 8.5.3 fixes Linux launching; 8.5.4 makes MOSS-Image previews render as ComfyUI does; 8.5.5 trains MOSS-Image at 1 MP; 8.5.8 fixes MOSS-Image training with block swap; 8.5.9 makes MOSS-Image Studio renders faster; 8.6.0 improves MOSS-Image likeness and adds an option for training on SFT; 8.6.1 fixes noisy Qwen Image 2.1 previews; 8.7 brings MOSS-Image likeness much sooner with a new Clean-end share option, 30% by default since 8.7.1, fine-tunes included in 8.7.2, since 8.7.3 a fine-tune fits a 16 GB card, and 8.7.4 adds an 8-step Turbo LoRA for fast previews on Base, 8.7.5 lets MOSS-Image train on computers with 16 GB of RAM, 8.7.6 fixes the cache on a resume and for a refilled folder, 8.7.7 drops Kromoss, 8.7.8 adds preview and save schedules, 8.7.9 is a maintenance release, and 8.8.0 fixes resuming a run on Python 3.10. [Release notes](docs/RELEASE_NOTES_v8.8.0.md) · [MOSS-Image guide](docs/MOSS_IMAGE.md)
+> - **Fizgig 8.4 — Fizgig LoRA Isolation.** Train two people into one LoRA and every stranger keeps their own face: with a normal LoRA 48 of 50 strangers came out looking like the trained person, with LoRA Isolation 0 of 50, at the same likeness. DOP from @ostris's AI-Toolkit at its base, with Fizgig's own techniques on top, set up on the Training tab's new Subjects card, on every model except ACE-Step. 8.4.2 adds a trigger word checker on the same card. [Demo](https://youtu.be/CNh4sN5vN_8) · [How to set it up](https://youtu.be/8uW5NdL5b20) · [Release notes](docs/RELEASE_NOTES_v8.4.0.md)
 > - **Fizgig 8.1 — Flux 3 Image Klein, from day one.** Black Forest Labs' new 5.6B text-to-image and edit model trains in Fizgig the day it came out: LoRAs, LoKRs, edit LoRAs from before/after pairs, slider LoRAs and full fine-tuning, from an 8 GB card, with every workbench tool, prompt travel and edit chains in LoRA Royale included. [Release notes](docs/RELEASE_NOTES_v8.1.0.md) · [Flux 3 guide](docs/FLUX3.md)
 > - **Fizgig 8 — the new app (yes, the web UI).** Fizgig opens in its own window or your browser, and your phone can watch a run. One **Pods** tab opens your other computers' GPUs, found on your network by themselves, and RunPod pods, logged in for you. What's training and what's up next sit in the sidebar on every tab, and **Runs & outputs** keeps every run. Updating keeps your settings, presets, folders and queued runs; a welcome tour on the first start shows where everything went. [Release notes](docs/RELEASE_NOTES_v8.0.0.md) · [The app](docs/WEB_UI.md)
 > - **Fizgig 7.3 — music with ACE-Step 1.5 XL.** Train LoRAs on your own songs, music sliders and full fine-tuning, previews you play in the gallery, and Repair Studio as a DAW for AI music: covers, repaint and extend, a model EQ. Gizmo gets a Music tab for cutting songs into sections. [Release notes](docs/RELEASE_NOTES_v7.3.0.md) · [ACE-Step guide](docs/ACESTEP.md)
@@ -70,12 +73,13 @@ https://github.com/user-attachments/assets/2db82d0d-e7ed-4f60-a79c-d2ac1f4984ac
 | **Krea 2** (12.9B) | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 8 GB | [Krea 2](docs/KREA2.md) |
 | **MiniMax H3** (33B) | photos, video clips, sound, voice | ✅ | ✅ | ✅ slider | ✅ experimental | 16 GB | [MiniMax H3](docs/MINIMAX_H3.md) |
 | **Qwen Image 2.1** | photos | ✅ | ✅ | ✅ slider + edit | ✅ experimental | 10 GB | [Qwen Image 2.1](docs/QWEN_IMAGE.md) |
+| **MOSS-Image** (5B), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 12 GB | [MOSS-Image](docs/MOSS_IMAGE.md) |
 | **Z-Image Turbo** (6B), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 12 GB | [7.1 notes](docs/RELEASE_NOTES_v7.1.0.md) |
 | **SDXL** (any checkpoint), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 8 GB | [7.0 notes](docs/RELEASE_NOTES_v7.0.0.md) |
 | **Anima** (2B), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 8 GB | [7.0 notes](docs/RELEASE_NOTES_v7.0.0.md) |
 | **ACE-Step 1.5 XL** (4B), experimental | songs | ✅ | — | ✅ slider | ✅ experimental | 16 GB | [ACE-Step](docs/ACESTEP.md) |
 
-Every image and video model gets all four workbench tools; ACE-Step has Studio and Extract. Qwen Image 2.1 trains on the base model and previews on Qwen's own Turbo (8 steps, CFG 1); your LoRAs work on both. MiniMax H3 also makes **RefMods**, tuned against H3 itself rather than a plain encode ([how do I…?](docs/REFMOD_HOWDOI.md)). Fizgig's training adapters for [Qwen Image 2.1](https://huggingface.co/ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter) and [Z-Image Turbo](https://huggingface.co/ShootTheSound/Fizgig-Z-Image-Turbo-Training-Adapter) are free on Hugging Face for any trainer. Full fine-tuning has [its own guide](docs/FINETUNE.md).
+Every image and video model gets all four workbench tools; ACE-Step has Studio and Extract. Qwen Image 2.1 trains on the base model and previews on Qwen's own Turbo (8 steps, CFG 1); your LoRAs work on both. MOSS-Image trains on Base and previews on MOSS-Image SFT, the model most people generate with. MiniMax H3 also makes **RefMods**, tuned against H3 itself rather than a plain encode ([how do I…?](docs/REFMOD_HOWDOI.md)). Fizgig's training adapters for [Qwen Image 2.1](https://huggingface.co/ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter) and [Z-Image Turbo](https://huggingface.co/ShootTheSound/Fizgig-Z-Image-Turbo-Training-Adapter) are free on Hugging Face for any trainer. Full fine-tuning has [its own guide](docs/FINETUNE.md).
 
 ## The workbench
 
@@ -91,8 +95,9 @@ Each tool works on your own runs **or any LoRA you've downloaded**, and they han
 ## Training features
 
 - **Presets per model**: pick a ✨ preset on the Training tab and go.
-- **Slider LoRAs** (Klein 9B, Flux 3 Image Klein, Krea 2, MiniMax H3, Qwen Image 2.1, Z-Image Turbo, SDXL, Anima): a LoRA whose strength is a dial between two looks, from photo pairs or three prompts, and a slider from prompts can be steered while it trains (change its ends, it trains on toward them). Krea 2's **Ultra mode** trains the composition blocks only, so the dial holds up at much higher strengths. It works best for sliders trained from prompts, and with photo pairs when the change is compositional.
+- **Slider LoRAs** (Klein 9B, Flux 3 Image Klein, Krea 2, MiniMax H3, Qwen Image 2.1, MOSS-Image, Z-Image Turbo, SDXL, Anima): a LoRA whose strength is a dial between two looks, from photo pairs or three prompts, and a slider from prompts can be steered while it trains (change its ends, it trains on toward them). Krea 2's **Ultra mode** trains the composition blocks only, so the dial holds up at much higher strengths. It works best for sliders trained from prompts, and with photo pairs when the change is compositional.
 - **Edit LoRAs** (Klein 9B, Flux 3 Image Klein, Qwen Image 2.1): teach an edit from pairs of original and edited photos, then apply it to any photo.
+- **Fizgig LoRA Isolation, on the Subjects card** (every model except ACE-Step): up to four people in one LoRA, each from their own folder. Fizgig's own techniques combined with DOP keep your subjects to their trigger words: leave the trigger out and you get the model's own people, and in a group picture your subjects, strangers and people the model already knows each keep their own face. [See it in action](https://youtu.be/CNh4sN5vN_8) · [How it works](docs/LORA_ISOLATION.md) · [How to set it up (video)](https://youtu.be/8uW5NdL5b20) · [How to caption for it](docs/MULTI_PERSON.md).
 - **Adaptive LR**: a plateau tracker that raises or lowers the rate within your Min/Max, with rollback on instability.
 - **Weight averaging (EMA)**, on by default where it's measured to help.
 - **Context LoRA**: train on top of a frozen, active LoRA so the two coexist (a face on a style, an outfit on a character). No other trainer does this.
@@ -101,6 +106,7 @@ Each tool works on your own runs **or any LoRA you've downloaded**, and they han
 - **Fast previews** in a few steps on a turbo or distilled model where one exists: Klein's and Flux 3 Image Klein's distilled models, the Turbo LoRAs for Krea 2, MiniMax H3, Qwen Image 2.1 and Anima, and Qwen Image 2.1's Turbo model.
 - **A sample gallery that scores likeness** live, and a run visualiser to scrub epochs.
 - **Dataset prep**: AI captions with Qwen3-VL or Florence-2, bilingual captions, face crops, and a Look Consistency Filter.
+- **Face backends for every kind of character**: face crops, the Look Filter and likeness scores work on anime, furry and fursuit characters as well as people (see the section below).
 - **Gizmo** (MiniMax H3): cut clips with scene detection, crop to the subject, and record or segment a voice dataset with Whisper transcription.
 
 Full list: [docs/TRAINING.md](docs/TRAINING.md). Everything also runs headless: [docs/CLI.md](docs/CLI.md).
@@ -121,6 +127,17 @@ Full list: [docs/TRAINING.md](docs/TRAINING.md). Everything also runs headless: 
 
 More: [docs/WEB_UI.md](docs/WEB_UI.md).
 
+## Face backends
+
+Face crops, the Look Consistency Filter and every likeness score can work on anime, furry and drawn characters and fursuits too, not just people.
+
+**The defaults are InsightFace (face finder) and ArcFace (look match), the same as before.** People's sets need nothing changed. Everything else is opt-in: open **Image Prep → Anime/furry/drawn characters** and pick:
+
+- **Face finder**: **Anime/furry/drawn (YOLO model)** for characters, or **Both** for a set with people and characters in it.
+- **Look match**: **Anime/furry/drawn** for characters, or **Auto (Decide for each set)**. Each look match has its own thresholds, and saved scores record which one made them.
+
+Setup (which face model to use and how to get it), numbers and limitations are in [docs/FACE_BACKENDS.md](docs/FACE_BACKENDS.md).
+
 ## Install
 
 Needs an NVIDIA RTX 30/40/50-series or an AMD Radeon with ROCm, Windows 10/11 or Linux, Python 3.10–3.13, and 32 GB of system RAM recommended. Full requirements, AMD ROCm and model downloads: [docs/INSTALL.md](docs/INSTALL.md).
@@ -133,14 +150,23 @@ cd Fizgig
 ```
 
 - **Windows (NVIDIA):** double-click `install_fizgig.bat`, then launch with `Launch Fizgig.bat` (its own window) or `Launch Fizgig in browser.bat` (in your web browser); update with `update_fizgig.bat`.
-- **Linux (NVIDIA):** `python install_fizgig.py`, then `./launch_fizgig.sh` or `./launch_fizgig_browser.sh`.
+- **Linux (NVIDIA):** `python install_fizgig.py`, then `./launch_fizgig.sh` or `./launch_fizgig_browser.sh`; update with `./update_fizgig.sh`.
 - **AMD ROCm:** see [docs/INSTALL.md](docs/INSTALL.md).
 
 Model files download from the **Preferences** tab: one **Download models for me** button per model.
 
 ### No GPU? Rent one
 
-The whole app runs in a browser tab on RunPod, with a drag-and-drop file manager for big datasets and fine-tunes (the **File manager** button in the sidebar), one-click model downloads and an optional auto-stop when training finishes. **[⚡ Deploy on RunPod →](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep)** · [Guide](docker/README.md)
+**Nothing to install on your computer:** the whole app runs on the pod, in your browser.
+
+1. **[⚡ Deploy on RunPod](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep)** (keep the 300 GB disk).
+2. Wait for **Ready** in the pod's **Logs** tab; the password is printed under it.
+3. **Connect → HTTP port 8081**, and log in with that password.
+4. **Preferences → Download models for me**, upload your training folder on the **Start** tab, and press **Start** on the **Training** tab.
+
+Prefer Vast.ai? The same image runs there: **[Fizgig on Vast.ai](https://cloud.vast.ai/?ref_id=757773&creator_id=757773&name=Fizgig%20LoRa%20Training%20and%20Fine-tuning)** ([guide](docs/VAST.md)).
+
+Step by step: [Quick start](docker/README.md#quick-start-nothing-installed-on-your-computer). The pod also has a drag-and-drop file manager for big datasets and fine-tunes (the **File manager** button in the sidebar), one-click model downloads and an optional auto-stop when training finishes. [The full pod guide](docker/README.md).
 
 Mid-job on the old pod with the remote desktop? It stays available as **[Fizgig Classic v7.x](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)**, and pods you already have keep running as they are.
 
@@ -185,11 +211,13 @@ Renting through the [RunPod link](https://console.runpod.io/deploy?type=GPU&gpu=
 | Guide | What's in it |
 |---|---|
 | [Install and requirements](docs/INSTALL.md) | Hardware, system RAM, AMD ROCm, model downloads, VRAM tables |
-| [Klein 9B](docs/KLEIN.md) · [Flux 3 Image Klein](docs/FLUX3.md) · [Krea 2](docs/KREA2.md) · [MiniMax H3](docs/MINIMAX_H3.md) · [Qwen Image 2.1](docs/QWEN_IMAGE.md) | Each model: presets, features, memory |
+| [Klein 9B](docs/KLEIN.md) · [Flux 3 Image Klein](docs/FLUX3.md) · [Krea 2](docs/KREA2.md) · [MiniMax H3](docs/MINIMAX_H3.md) · [Qwen Image 2.1](docs/QWEN_IMAGE.md) · [MOSS-Image](docs/MOSS_IMAGE.md) | Each model: presets, features, memory |
 | [Training and the workbench](docs/TRAINING.md) | The shared features and tools in detail |
+| [Face backends](docs/FACE_BACKENDS.md) | Face finder (InsightFace / YOLO) and look match (ArcFace / DINOv2) for people, anime and furry |
 | [Full fine-tuning](docs/FINETUNE.md) · [How do I…?](docs/FINETUNE_HOWDOI.md) | Training the base model itself |
 | [RefMods](docs/REFMOD_HOWDOI.md) | RefMods for MiniMax H3 |
 | [Command line](docs/CLI.md) | Every trainer, headless |
+| [Fizgig LoRA Isolation](docs/LORA_ISOLATION.md) | How it works, the recipe and the results |
 | [The app](docs/WEB_UI.md) | Starting Fizgig, its window and browser, your phone, your other computers, the port and password, pods |
 | [RunPod](docker/README.md) | The cloud image |
 
