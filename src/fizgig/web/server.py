@@ -1369,10 +1369,21 @@ def _queue_starter(item):
     return False, r.get("error") or "; ".join(r.get("problems") or ["it couldn't start"])
 
 
+def _wants_multi_gpu(cmd):
+    """A training command with the Multi-GPU dropdown on (--multi_gpu=ddp / split, or the two-word form)."""
+    args = [str(a) for a in cmd]
+    for i, a in enumerate(args):
+        v = a.split("=", 1)[1] if a.startswith("--multi_gpu=") else (args[i + 1] if a == "--multi_gpu" and
+                                                                      i + 1 < len(args) else None)
+        if v is not None and v.strip().lower() not in ("", "off"):
+            return True
+    return False
+
+
 def _popen(cmd):
     """As the desktop's run_subprocess: UTF-8, unbuffered, the chosen GPU, its own process group (and below-normal
-    priority on Windows, so the desktop stays smooth)."""
-    env = gpu_env(dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1"))
+    priority on Windows, so the desktop stays smooth). A Multi-GPU run gets every card, the chosen one first."""
+    env = gpu_env(dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1"), multi=_wants_multi_gpu(cmd))
     kw = {}
     if os.name == "nt":
         kw["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
@@ -1402,12 +1413,19 @@ def pod_storage():
     return [f"Storage: {free:.0f} GB free of {total:.0f} GB on /workspace", free < 40]
 
 
-def gpu_env(env, prefs=None):
+def gpu_env(env, prefs=None, multi=False):
     """env with the GPU chosen in Preferences (cuda_device), as the desktop app runs everything: one set where Fizgig
-    was started wins. Training, captions, Studio, Profiler and Extract all use it."""
+    was started wins. Training, captions, Studio, Profiler and Extract all use it. multi (a Multi-GPU training run):
+    every card, the chosen one first - the trainer's first GPU renders the previews and saves, and pinned to the
+    chosen card alone it saw one GPU and trained on that."""
     want = str((prefs if prefs is not None else load_prefs()).get("cuda_device") or "").strip()
     if want and not os.environ.get("CUDA_VISIBLE_DEVICES"):
         env["CUDA_VISIBLE_DEVICES"] = want
+        rows = list_gpus() if multi else []
+        if len(rows) > 1:
+            first = _chosen_gpu(rows, want)
+            key = "uuid" if want.startswith("GPU-") else "index"
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(r[key]) for r in [first] + [r for r in rows if r is not first])
     if env.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip().isdigit():
         env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")      # a card number means the card nvidia-smi numbers so
     return env
