@@ -1308,8 +1308,13 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     logger.info(f"Loading {desc.display_name} DiT ({precision}) from {dit_path}")
     if split_devs is not None:
         # loaded and quantised on the CPU side (INT8 kept there), then each part goes to its own card
-        dit = driver.load_dit(dit_path, "cpu")
-        quant.quantize(dit, driver, precision, split_devs[0], store_device="cpu")
+        # a driver's own tiers first (Qwen 2.1's int8 ConvRot file: its int8 weights as stored, not quantised again)
+        own = driver.load_planned(dit_path, "cpu", precision, 0)
+        if own is not None:
+            dit = own[0]
+        else:
+            dit = driver.load_dit(dit_path, "cpu")
+            quant.quantize(dit, driver, precision, split_devs[0], store_device="cpu")
         multigpu.split_model(driver, dit, split_devs, split_at)
         swapped = 0
     elif ddp is not None:

@@ -5,7 +5,7 @@ RESEARCH_qwen_image_2_1_*.md files). Sources are cited per value. Training entry
 the family is trained through its driver (qwen_image21/driver.py) by the generic cache + train entry points.
 """
 from fizgig.families.description import (
-    GENERAL_NEGATIVE, FamilyDescription, LoRAFormat, ModelFile, SamplingSettings, SpeedLoRA,
+    GENERAL_NEGATIVE, FamilyDescription, LoRAFormat, ModelFile, SamplingSettings, SpeedLoRA, multi_gpu_option,
 )
 
 _CARD = "https://huggingface.co/Qwen/Qwen-Image-2.1"
@@ -188,6 +188,10 @@ QWEN_IMAGE_21 = FamilyDescription(
     int8_attention=True,              # workbench renders: comfy-kitchen's INT8 attention
     activation_cache=True,            # Turbo Preview: step-1 replay, identical to a full render
     finetune=True,                  # the driver's ft_spec (families/ft.py)
+    # two GPUs (families/multigpu.py): the 32 blocks split between the cards; the embeddings, the modulation and
+    # the output layer stay on the first (QwenImage21DiT.forward crosses once, before the split's block)
+    multi_gpu=("ddp", "split"),
+    options=(multi_gpu_option("QWEN21", "its 32 blocks"),),
     # measured 28 Sep 2026: 40-48 pairs learned a grade on held-out photos in 6-8 epochs at 0.5 MP
     edit_note=("About 40 pairs (20 at least; more if your photos vary a lot). Each photo 1 MP or larger, e.g. "
                "1200x800; bigger is fine, Fizgig resizes them. An original and its edited version must have the "

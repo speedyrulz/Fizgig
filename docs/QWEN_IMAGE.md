@@ -54,7 +54,17 @@ If a later epoch looks softer than you'd like, an earlier one is often the bette
 | 12–16 GB | INT8, no block swap |
 | 10 GB | 4-bit NF4 |
 
-The text encoder only encodes, and loads in 8-bit below about 20 GB free (about 8 GB in all), which is what sets the 10 GB floor. On an RTX 5090 limited to 12 GB, the Fast preset trained on INT8 with a 9.9 GB peak, previews included; limited to 10 GB, on NF4 with a 7.3 GB peak.
+The text encoder only encodes, and loads in 8-bit below about 20 GB free (about 8 GB in all), which is what sets the 10 GB floor. The int8 ConvRot text encoder (`qwen3vl_8b_int8_convrot.safetensors`) always runs on its own int8 weights (about 7 GB), and a ComfyUI-format VAE such as the texture-fix VAE loads as the official one does. On an RTX 5090 limited to 12 GB, the Fast preset trained on INT8 with a 9.9 GB peak, previews included; limited to 10 GB, on NF4 with a 7.3 GB peak.
+
+## Two GPUs
+
+With two NVIDIA GPUs in the machine, **Multi-GPU** (Training tab, Training Parameters) trains a Qwen Image 2.1 LoRA, LoKR, slider, edit LoRA or full fine-tune on both, the same two ways as [Krea 2](KREA2.md#two-gpus): **full model on each** (each card trains half of every epoch's images, close to twice as fast) or **split the model** (one copy, its 32 blocks shared between the cards, for cards too small for the precision you want). Qwen particulars:
+
+- An int8 ConvRot DiT (Comfy-Org's int8 files and merges saved the same way) trains on its own int8 weights in both modes, as on one card.
+- Split keeps the embeddings, the modulation and the output layer on the first card; the console prints where the split landed. Block Swap and Compile Blocks are off.
+- Previews on the Turbo model: a split training model steps off both cards onto the CPU for each round of previews and comes back to its split after (a one-card run streams its blocks instead).
+- Measured on an RTX 4060 Ti + 5060 Ti (16 GB each), an int8 ConvRot base, 15 images at about 1 MP, rank 8: full model on each, 2 epochs in 2 min 49 s at 10.5 GB per card; split, 5 min 4 s at 6.0 and 6.4 GB.
+- Headless: `--multi_gpu ddp` or `--multi_gpu split` (and `--split_at N`) on `src/fizgig/families/train.py`. See [CLI.md](CLI.md#qwen-image-21-training).
 
 ## Previews and Turbo
 

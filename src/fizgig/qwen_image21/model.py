@@ -4,6 +4,7 @@
 # per-segment block-causal decomposition (the reference's QwenImage21AttnProcessor; the flex path is not ported),
 # non-reentrant gradient checkpointing, a loader for the ComfyUI single file (fused MLP) and the diffusers shards.
 """Qwen Image 2.1 single-stream DiT (7.1B, 32 identical blocks, patch size 1, block-causal attention)."""
+import contextlib
 import math
 from typing import Optional
 
@@ -427,18 +428,32 @@ class QwenImage21DiT(nn.Module):
         segments = prefix_segments(image_ids, prefix_len)
 
         blocks = list(self.transformer_blocks) if self.blocks_to_swap else None
+        # Two-GPU split (families/multigpu.py): the blocks from `at` on live on the second GPU. The stream and the
+        # blocks' inputs cross once, there (segments are plain ints); the output layer is back on the first
+        split = getattr(self, "_fizgig_split", None)
+        at = split["at"] if split is not None else -1
+        dev_ctx = contextlib.nullcontext()
         for index, block in enumerate(self.transformer_blocks):
+            if index == at:
+                dev = split["devices"][1]
+                joint, modulation, rotary = joint.to(dev), modulation.to(dev), rotary.to(dev)
+                mod_mask = mod_mask.to(dev) if mod_mask is not None else None
+                key_valid = key_valid.to(dev) if key_valid is not None else None
+                dev_ctx = torch.cuda.device(dev)       # kernels (Triton's among them) launch on the blocks' GPU
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(index)
-            if getattr(block, "_handles_checkpointing", False):    # compiled: the wrapper checkpoints itself
-                joint = block(joint, modulation, rotary, mod_mask, segments, key_valid)
-            elif torch.is_grad_enabled() and self.gradient_checkpointing:
-                joint = checkpoint(block, joint, modulation, rotary, mod_mask, segments, key_valid,
-                                   use_reentrant=False)
-            else:
-                joint = block(joint, modulation, rotary, mod_mask, segments, key_valid)
+            with dev_ctx:
+                if getattr(block, "_handles_checkpointing", False):    # compiled: the wrapper checkpoints itself
+                    joint = block(joint, modulation, rotary, mod_mask, segments, key_valid)
+                elif torch.is_grad_enabled() and self.gradient_checkpointing:
+                    joint = checkpoint(block, joint, modulation, rotary, mod_mask, segments, key_valid,
+                                       use_reentrant=False)
+                else:
+                    joint = block(joint, modulation, rotary, mod_mask, segments, key_valid)
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(blocks, index)
+        if split is not None:
+            joint, mod_mask = joint.to(temb.device), target_token_mask if self.causal_condition else None
 
         joint = self.norm_out(joint, temb, mod_mask)
         return self.proj_out(joint)

@@ -48,6 +48,11 @@ class QwenImage21Driver(FamilyDriver):
         logger.info(f"[precision] {os.path.basename(path)}: decoded to INT8 with {swap} blocks streamed")
         return dit, swap
 
+    def split_blocks(self, dit):
+        # the 32 blocks; the embeddings, the modulation and the output layer stay on the first GPU
+        # (QwenImage21DiT.forward moves the stream across and the result back)
+        return dit.transformer_blocks
+
     def max_blocks_to_swap(self, dit=None):
         return len(dit.transformer_blocks) - 2 if dit is not None else self.description.n_blocks - 2
 
@@ -64,9 +69,16 @@ class QwenImage21Driver(FamilyDriver):
     # ---- training previews on the Turbo checkpoint (Klein's Distilled handoff) ----------------------------------
     def park_for_preview(self, dit, device):
         """Stream all but two of the training model's blocks so the Turbo fits beside it; an NF4 base cannot stream and
-        is small - left as it is (token None)."""
+        is small - left as it is (token None). A model split over two cards doesn't stream: parked whole on the CPU
+        (token 0; unpark puts it back to its split)."""
         if getattr(dit, "_nf4_quantized", False):
             return None
+        from fizgig.families import multigpu
+        if multigpu.is_split(dit):
+            from fizgig.families import quant
+            quant.move(dit, "cpu")
+            torch.cuda.empty_cache()
+            return 0
         orig = int(dit.blocks_to_swap or 0)
         dit.enable_block_swap(len(dit.transformer_blocks) - 2, torch.device(device), True)
         dit.prepare_block_swap_before_forward()

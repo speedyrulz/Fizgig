@@ -603,6 +603,8 @@ The other two presets change only a few flags. **Standard** is `--network_dim 16
 
 **Fine-tuning the base model** — `--finetune` (with `--ft_rotations`, `--ft_save_every_rotations`, `--ft_rotate_every`) trains Qwen's own weights a component at a time instead of a LoRA, as on Krea 2; the GUI starts it at a learning rate of 1e-5. See [FINETUNE.md](FINETUNE.md).
 
+**Two GPUs** — `--multi_gpu ddp` (the whole model on each card, half the images each) or `--multi_gpu split` (one model, its 32 blocks divided between the cards; `--split_at N` picks the first block on the second card) work as for [Krea 2](#krea-2-training), fine-tunes included. Split keeps the embeddings, the modulation and the output layer on the first card. An int8 ConvRot DiT runs on its int8 weights in both modes.
+
 **Other** — `--context_lora_path FILE --context_lora_strength S` trains on top of an existing Qwen LoRA, frozen and active in training and previews (not with `--finetune`). `--metadata_title/author/description/license/tags/trigger_phrase` are recorded in the saved LoRA. The saved file loads in ComfyUI's standard LoRA loader.
 
 ---
