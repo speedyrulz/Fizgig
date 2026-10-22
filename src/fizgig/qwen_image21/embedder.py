@@ -5,8 +5,8 @@ raw template string (not apply_chat_template - "the two tokenize differently and
 left padding, `hidden_states[-1]` with the final norm neutralised by a forward hook, the system-turn tokens dropped,
 an empty prompt becomes " ". Text-to-image only for now (no reference images).
 
-Weights: the ComfyUI single file (bare `model.` / `model.visual.` keys, converted by the Krea 2 loader's converter)
-or official shards; the vision tower and LM head are dropped after loading. Tokenizer/processor: the Qwen-Image-2.1 `processor/` files (they differ from the Qwen3-VL-4B copy
+Weights: the ComfyUI single file (bare `model.` / `model.visual.` keys, converted by the Krea 2 loader's converter),
+its int8 ConvRot repack (qwen3vl_8b_int8_convrot, run on its int8 weights as stored) or official shards; the vision tower and LM head are dropped after loading. Tokenizer/processor: the Qwen-Image-2.1 `processor/` files (they differ from the Qwen3-VL-4B copy
 bundled for Krea 2).
 """
 import json
@@ -53,6 +53,57 @@ def _w8_forward(self, x):
 _W8_GROUP = 64
 
 
+def _take_convrot(sd):
+    """Pop ComfyUI's int8 ConvRot weights (qwen3vl_8b_int8_convrot: each Linear, the embedding and the LM head as
+    int8 codes in a rotated basis + a per-row scale + a `.comfy_quant` marker) -> {module name: (codes, scale,
+    rotation)}. {} for a bf16 file."""
+    out = {}
+    for k in [k for k in sd if k.endswith(".comfy_quant")]:
+        from fizgig.minimax.convrot import parse_comfy_quant
+        base = k[: -len(".comfy_quant")]
+        conf = parse_comfy_quant(sd.pop(k))
+        if conf.get("format") != "int8_tensorwise":
+            raise ValueError(f"{base}: unsupported comfy quant format {conf.get('format')!r}")
+        rot = int(conf.get("convrot_groupsize", 256)) if conf.get("convrot") else 1
+        out[base] = (sd.pop(base + ".weight").contiguous(), sd.pop(base + ".weight_scale").float().reshape(-1, 1),
+                     rot)
+    return out
+
+
+class _ConvRotInt8Embedding(torch.nn.Module):
+    """The token embedding kept as the file's int8 ConvRot rows: a looked-up row is scaled and rotated back (the
+    rotation runs along the hidden dim, so each row decodes on its own) - a few tokens' work, never the table."""
+
+    def __init__(self, qdata, wscale, rot, dtype):
+        super().__init__()
+        self.rot, self.dtype = rot, dtype
+        self.register_buffer("qdata", qdata, persistent=False)
+        self.register_buffer("wscale", wscale, persistent=False)
+
+    def forward(self, ids):
+        from fizgig.minimax.convrot import rotate
+        return rotate(self.qdata[ids].float() * self.wscale[ids], self.rot).to(self.dtype)
+
+
+def _install_convrot(model, rot, dtype):
+    """Each int8 ConvRot weight into its module, as stored: Linears as ConvRotInt8Linear (the activation is rotated,
+    the weight never decoded - the Turbo DiT's and H3's layer), the embedding as _ConvRotInt8Embedding."""
+    from fizgig.minimax.convrot import ConvRotInt8Linear
+    for name, (q, sc, r) in rot.items():
+        parent, attr = name.rsplit(".", 1)
+        old = model.get_submodule(name)
+        if isinstance(old, torch.nn.Embedding):
+            new = _ConvRotInt8Embedding(q, sc, r, dtype)
+        else:
+            with torch.device("meta"):
+                new = ConvRotInt8Linear(old.in_features, old.out_features, bias=old.bias is not None, rot=r,
+                                        compute_dtype=dtype)
+            new.qdata, new.wscale = q, sc
+            if old.bias is not None:
+                new.bias = old.bias
+        setattr(model.get_submodule(parent), attr, new)
+
+
 @torch.no_grad()
 def _int8_weights(model, prefix, device):
     """Weight-only 8-bit with one scale per 64 weights, dequantised per matmul; activations stay bf16. Measured on
@@ -95,17 +146,26 @@ class Qwen21TextEncoder:
         config = Qwen3VLConfig.from_dict(_text_encoder_config(config_path))
         with init_empty_weights():
             model = Qwen3VLForConditionalGeneration._from_config(config)
-        sd = _convert_comfyui_qwen3vl_state_dict(load_split_weights(model_path, device="cpu", dtype=dtype))
+        sd = _convert_comfyui_qwen3vl_state_dict(load_split_weights(model_path, device="cpu"))
+        rot = _take_convrot(sd)
+        rot.pop("lm_head", None)           # dropped below: never installed
+        sd = {k: v.to(dtype) if v.is_floating_point() else v for k, v in sd.items()}
         info = model.load_state_dict(sd, strict=False, assign=True)
-        if info.unexpected_keys or info.missing_keys:
-            raise RuntimeError(f"Qwen3-VL-8B checkpoint mismatch: missing={info.missing_keys[:8]}, "
+        missing = [k for k in info.missing_keys if k.rsplit(".", 1)[0] not in rot and k != "lm_head.weight"]
+        if info.unexpected_keys or missing or (not rot and info.missing_keys):
+            raise RuntimeError(f"Qwen3-VL-8B checkpoint mismatch: missing={(missing or info.missing_keys)[:8]}, "
                                f"unexpected={info.unexpected_keys[:8]}")
         model.lm_head = None
+        if rot:
+            _install_convrot(model, rot, dtype)
         if not vision:
             model.model.visual = None
         self.vision = vision
         del sd
-        if int8:
+        if rot:
+            logger.info(f"[text encoder] int8 ConvRot file: {len(rot)} weights kept as stored (int8, the activation "
+                        "rotated per matmul)")
+        elif int8:
             n = _int8_weights(model, "language_model.layers.", self.device)
             logger.info(f"[text encoder] 8-bit weights: {n} language-model Linears (low-VRAM card); matmuls stay bf16")
         self.model = model.to(self.device).eval().requires_grad_(False)
